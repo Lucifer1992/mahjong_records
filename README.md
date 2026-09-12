@@ -175,7 +175,7 @@ scp -r server/ deploy@your-server:/home/deploy/mahjong/
 
 ssh deploy@your-server
 cd /home/deploy/mahjong/server
-npm install --production
+npm install            # 不带 --production：要跑 init-db + build，需要 dev deps
 cp .env.example .env
 nano .env  # 修改 JWT_SECRET 等
 npm run init-db

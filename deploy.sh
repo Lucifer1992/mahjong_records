@@ -85,7 +85,10 @@ fi
 if [ -d "node_modules" ]; then
   info "node_modules 已存在,跳过安装 (重装请加 --reset)"
 else
-  npm install --production
+  # 注意：不带 --production！
+  # 步骤 4 要跑 `npm run init-db`，步骤 5 要 `npm run build`，都依赖 tsx + typescript（dev deps）
+  # 生产环境多 ~50MB dev deps 无影响，换简洁和稳定
+  npm install
 fi
 
 # ----- 3. 配置 .env -----

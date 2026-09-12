@@ -42,7 +42,7 @@ export async function login(code: string, nickname?: string, avatar?: string): P
   const realOpenid = await fetchOpenidByCode(code);
 
   // dev 模式：用 code 模拟一个稳定 openid（仅开发环境生效）
-  const openid = realOpenid ?? (config.isDev ? `dev_${code}` : '');
+  const openid = realOpenid ?? (config.isDev() ? `dev_${code}` : '');
 
   if (!openid) {
     throw new Error('login failed: cannot resolve openid');

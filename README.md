@@ -149,11 +149,14 @@ curl -X POST http://localhost:3456/api/records \
 
 ### 方案 A：单台 VPS（推荐独立开发者）
 
+> **从 2026-09-12 起，`deploy.sh` 已自动完成 PM2 / Nginx / HTTPS 全流程**。
+> 手动步骤 3-5 仅作参考，自动化已覆盖。
+
 #### 1. 服务器准备
 
 ```bash
 # Ubuntu 22.04+
-sudo apt update && sudo apt install -y nodejs npm nginx certbot python3-certbot-nginx
+sudo apt update && sudo apt install -y nginx certbot python3-certbot-nginx
 
 # 安装 Node 18+（NodeSource）
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
@@ -167,7 +170,7 @@ sudo useradd -m -s /bin/bash deploy
 sudo su - deploy
 ```
 
-#### 2. 上传代码 + 安装
+#### 2. 一键部署（推荐）
 
 ```bash
 # 把 server 目录 scp/rsync 到服务器
@@ -175,72 +178,45 @@ scp -r server/ deploy@your-server:/home/deploy/mahjong/
 
 ssh deploy@your-server
 cd /home/deploy/mahjong/server
-npm install            # 不带 --production：要跑 init-db + build，需要 dev deps
+
+# 首次部署：自动完成 10 步
 cp .env.example .env
-nano .env  # 修改 JWT_SECRET 等
-npm run init-db
-npm run build
+nano .env  # 必改 JWT_SECRET + 加 API_DOMAIN=mahjong.your-domain.com + CERTBOT_EMAIL=you@xxx.com
+bash deploy.sh --init
 ```
 
-#### 3. PM2 启动 + 开机自启
+`deploy.sh` 会自动完成：
+
+| 步骤 | 内容 |
+|---|---|
+| 0/10 | 环境检查（Node / PM2 / Nginx / certbot） |
+| 1/10 | 拉最新代码（git pull） |
+| 2/10 | 装依赖（含 tsx/typescript） |
+| 3/10 | 校验 `.env`（强制改 JWT_SECRET） |
+| 4/10 | 初始化 SQLite |
+| 5/10 | TypeScript 编译 |
+| 6/10 | PM2 启动 / reload（0 停机） |
+| 7/10 | pm2-logrotate 安装 + 配置 |
+| 8/10 | **写 Nginx 反代配置**（读 `API_DOMAIN`） |
+| 9/10 | **certbot 申请 HTTPS 证书**（HTTP 自动 301 → HTTPS） |
+| 10/10 | 健康检查（走 HTTPS） |
+
+#### 3. 小程序后台加白名单
+
+微信公众平台 → 开发管理 → 服务器域名 → 添加 `https://mahjong.your-domain.com`
+
+> ⚠️ **必须 https://** 且**不能带端口**（小程序强制 443）。
+
+#### 4. 后续更新（已自动化）
 
 ```bash
-pm2 start ecosystem.config.cjs
-pm2 save
-pm2 startup  # 复制输出的 sudo 命令执行
-```
-
-#### 4. Nginx 反代
-
-`/etc/nginx/sites-available/mahjong`：
-
-```nginx
-server {
-    listen 80;
-    server_name api.your-domain.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:3456;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 60s;
-    }
-}
-```
-
-```bash
-sudo ln -s /etc/nginx/sites-available/mahjong /etc/nginx/sites-enabled/
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
-#### 5. HTTPS（Let's Encrypt 免费）
-
-```bash
-sudo certbot --nginx -d api.your-domain.com
-# 自动续期已配置，无需额外操作
-```
-
-#### 6. 小程序后台加白名单
-
-微信公众平台 → 开发管理 → 服务器域名 → 添加 `https://api.your-domain.com`
-
-#### 7. 后续更新
-
-```bash
-# 本地
-git pull && npm install && npm run build
-rsync -avz --exclude='node_modules' --exclude='data' \
-  ./server/ deploy@your-server:/home/deploy/mahjong/server/
-
-# 服务器
+# 服务器（直接跑 deploy.sh，会自动 git pull + reload）
 ssh deploy@your-server
 cd /home/deploy/mahjong/server
-pm2 reload ecosystem.config.cjs    # 0 停机热重载
+bash deploy.sh
 ```
+
+部署脚本检测到已有进程会 `pm2 reload`（0 停机），检测到 `.env` 已存在会跳过，检测到证书已存在会跳过。所以**同一命令既能首次部署又能增量更新**，幂等。
 
 ### 方案 B：PM2 远程部署（适合多服务器）
 

@@ -6,6 +6,10 @@
 #   1) 首次部署（推荐）：bash deploy.sh --init
 #   2) 后续更新：        bash deploy.sh
 #   3) 完全重置：        bash deploy.sh --reset
+#
+# 完整步骤（10 步）：
+#   0 环境检查 → 1 拉代码 → 2 装依赖 → 3 .env → 4 数据库
+#   → 5 编译 → 6 PM2 → 7 日志治理 → 8 Nginx → 9 HTTPS → 10 健康检查
 # ============================================
 
 set -e
@@ -39,7 +43,7 @@ for arg in "$@"; do
 done
 
 # ----- 0. 环境检查 -----
-step "0/8 环境检查"
+step "0/10 环境检查"
 
 if ! command -v node &> /dev/null; then
   err "未检测到 Node.js"
@@ -65,8 +69,26 @@ if ! command -v pm2 &> /dev/null; then
 fi
 info "PM2 $(pm2 -v)"
 
+# 检测 nginx / certbot（步骤 8/9 用）
+HAS_NGINX=false
+HAS_CERTBOT=false
+if command -v nginx >/dev/null 2>&1; then
+  HAS_NGINX=true
+  info "Nginx $(nginx -v 2>&1 | cut -d'/' -f2)"
+fi
+if command -v certbot >/dev/null 2>&1; then
+  HAS_CERTBOT=true
+  info "certbot $(certbot --version 2>&1 | cut -d' ' -f2)"
+fi
+if [ "$HAS_NGINX" = false ]; then
+  warn "未检测到 nginx,步骤 8 将跳过（手动配也行）"
+fi
+if [ "$HAS_CERTBOT" = false ]; then
+  warn "未检测到 certbot,步骤 9 将跳过"
+fi
+
 # ----- 1. 拉代码 / 准备目录 -----
-step "1/8 准备代码"
+step "1/10 准备代码"
 if [ -d ".git" ]; then
   info "检测到 git 仓库,拉取最新代码..."
   git pull --rebase --autostash
@@ -76,7 +98,7 @@ else
 fi
 
 # ----- 2. 安装依赖 -----
-step "2/8 安装依赖"
+step "2/10 安装依赖"
 if [ "$MODE" = "reset" ] && [ -d "node_modules" ]; then
   warn "--reset 模式,清理 node_modules..."
   rm -rf node_modules
@@ -92,7 +114,7 @@ else
 fi
 
 # ----- 3. 配置 .env -----
-step "3/8 配置环境变量"
+step "3/10 配置环境变量"
 if [ ! -f ".env" ]; then
   cp .env.example .env
   warn ".env 已生成 (基于 .env.example)"
@@ -113,8 +135,19 @@ else
   fi
 fi
 
+# 检查 .env 里的 nginx / certbot 相关配置
+ENV_DOMAIN=$(grep -E "^API_DOMAIN=" .env 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'" | tr -d ' \t\r\n')
+ENV_EMAIL=$(grep -E "^CERTBOT_EMAIL=" .env 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'" | tr -d ' \t\r\n')
+
+if [ -z "$ENV_DOMAIN" ]; then
+  warn ".env 未设 API_DOMAIN,步骤 8/9 将跳过 Nginx + HTTPS 配置"
+  warn "如需启用,加: API_DOMAIN=mahjong.your-domain.com"
+else
+  info "API_DOMAIN = $ENV_DOMAIN (步骤 8/9 将自动配置 Nginx + HTTPS)"
+fi
+
 # ----- 4. 初始化数据库 -----
-step "4/8 数据库"
+step "4/10 数据库"
 mkdir -p data
 
 if [ "$MODE" = "init" ] || [ "$MODE" = "reset" ]; then
@@ -131,7 +164,7 @@ else
 fi
 
 # ----- 5. 编译 -----
-step "5/8 编译 TypeScript"
+step "5/10 编译 TypeScript"
 if [ -d "dist" ] && [ "$MODE" != "reset" ]; then
   info "dist 已存在,增量编译..."
 else
@@ -146,7 +179,7 @@ fi
 info "编译产物: dist/index.js ✓"
 
 # ----- 6. PM2 启动 / 重载 -----
-step "6/8 PM2 启动"
+step "6/10 PM2 启动"
 
 if pm2 list 2>/dev/null | grep -q "mahjong-records"; then
   info "检测到已有进程,执行 graceful reload (0 停机)..."
@@ -163,7 +196,7 @@ else
 fi
 
 # ----- 7. 日志治理 (pm2-logrotate) -----
-step "7/8 日志治理 (pm2-logrotate)"
+step "7/10 日志治理 (pm2-logrotate)"
 
 # 幂等安装：已装则跳过
 if pm2 module:list 2>/dev/null | grep -q "pm2-logrotate"; then
@@ -185,15 +218,139 @@ pm2 set pm2-logrotate:dateFormat YYYY-MM-DD-HH-mm-ss
 pm2 set pm2-logrotate:workerInterval 30       # 30 秒检查一次
 pm2 set pm2-logrotate:rotateInterval '0 0 0 * * *'  # 每日 0 点强制切
 
-# ----- 8. 健康检查 -----
-step "8/8 健康检查"
+# ----- 8. Nginx 反代配置 -----
+step "8/10 Nginx 反代配置"
+
+if [ "$HAS_NGINX" = false ]; then
+  warn "nginx 未安装,跳过（手动配可参考 README.md）"
+  warn "安装: sudo apt install -y nginx"
+elif [ -z "$ENV_DOMAIN" ]; then
+  warn ".env 未设 API_DOMAIN,跳过 Nginx 配置"
+  warn "启用方法: 编辑 .env 加 API_DOMAIN=mahjong.your-domain.com 后重跑"
+else
+  info "配置域名: $ENV_DOMAIN"
+
+  NGINX_CONF="/etc/nginx/sites-available/mahjong"
+  NGINX_LINK="/etc/nginx/sites-enabled/mahjong"
+
+  # 幂等写入：备份老配置 + 写新配置
+  if [ -f "$NGINX_CONF" ]; then
+    sudo cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+    info "已备份旧配置: ${NGINX_CONF}.bak.*"
+  fi
+
+  sudo tee "$NGINX_CONF" > /dev/null <<NGINX_EOF
+# 麻将记录小程序 - 反代配置
+# 由 deploy.sh 自动生成（可手动编辑,下次 deploy 会备份后覆盖）
+server {
+    listen 80;
+    server_name ${ENV_DOMAIN};
+
+    # 安全: 禁止直接访问敏感路径
+    location ~ /\.(env|git) { deny all; return 404; }
+
+    location / {
+        proxy_pass http://127.0.0.1:3456;
+        proxy_http_version 1.1;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 60s;
+        proxy_connect_timeout 10s;
+
+        # 客户端真实 IP 给 Express 用
+        real_ip_header X-Real-IP;
+        set_real_ip_from 127.0.0.1;
+    }
+}
+NGINX_EOF
+  info "已写入: $NGINX_CONF"
+
+  # 启用站点（创建软链接）
+  if [ ! -L "$NGINX_LINK" ]; then
+    sudo ln -s "$NGINX_CONF" "$NGINX_LINK"
+    info "已创建软链接: $NGINX_LINK"
+  else
+    info "软链接已存在"
+  fi
+
+  # 移除默认站点（避免占用 80 端口冲突）
+  if [ -L "/etc/nginx/sites-enabled/default" ]; then
+    sudo rm /etc/nginx/sites-enabled/default
+    info "已移除默认站点"
+  fi
+
+  # 验证 + 生效
+  if sudo nginx -t 2>&1 | grep -q "successful"; then
+    sudo systemctl reload nginx
+    info "✅ Nginx 配置已 reload"
+  else
+    err "❌ Nginx 配置有误,请手动: sudo nginx -t"
+  fi
+fi
+
+# ----- 9. HTTPS 证书 -----
+step "9/10 HTTPS 证书 (Let's Encrypt)"
+
+if [ "$HAS_CERTBOT" = false ]; then
+  warn "certbot 未安装,跳过"
+  warn "安装: sudo apt install -y certbot python3-certbot-nginx"
+elif [ -z "$ENV_DOMAIN" ]; then
+  warn ".env 未设 API_DOMAIN,跳过证书申请"
+elif sudo certbot certificates 2>/dev/null | grep -q "Certificate Name: $ENV_DOMAIN"; then
+  info "✅ 证书已存在: $ENV_DOMAIN"
+  sudo certbot certificates 2>/dev/null | grep -A 6 "Certificate Name: $ENV_DOMAIN" | tee -a /tmp/cert-check.log 2>/dev/null || true
+else
+  info "未找到证书,尝试申请: $ENV_DOMAIN"
+
+  # 邮箱
+  if [ -z "$ENV_EMAIL" ]; then
+    warn ".env 未设 CERTBOT_EMAIL,使用占位邮箱"
+    warn "建议在 .env 加 CERTBOT_EMAIL=your-real@email.com 后重新申请"
+    ENV_EMAIL="admin@$(echo $ENV_DOMAIN | cut -d. -f2-)"
+  fi
+  info "使用邮箱: $ENV_EMAIL"
+
+  # 防火墙检查（80 必须开放才能申请）
+  if command -v ufw >/dev/null 2>&1; then
+    if sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+      if ! sudo ufw status 2>/dev/null | grep -q "80/tcp"; then
+        warn "UFW 防火墙未开放 80 端口,certbot 申请会失败"
+        warn "执行: sudo ufw allow 80/tcp"
+      fi
+    fi
+  fi
+
+  # 申请证书（非交互 + 自动同意 + 自动配 Nginx）
+  if sudo certbot --nginx \
+      -d "$ENV_DOMAIN" \
+      --non-interactive --agree-tos -m "$ENV_EMAIL" \
+      --redirect 2>&1 | tee -a /tmp/certbot.log; then
+    info "✅ HTTPS 证书申请成功,HTTP → HTTPS 自动重定向已配置"
+  else
+    err "❌ certbot 申请失败"
+    err "常见排查:"
+    err "  1. DNS: ping $ENV_DOMAIN 应返回本机公网 IP"
+    err "  2. 80 端口: sudo ufw allow 80/tcp && curl http://$ENV_DOMAIN"
+    err "  3. 邮箱被拒: 换 gmail 或企业邮箱"
+    err "手动重试: sudo certbot --nginx -d $ENV_DOMAIN"
+  fi
+fi
+
+# ----- 10. 健康检查 -----
+step "10/10 健康检查"
 sleep 2
 
+# 优先走 HTTPS（如果有证书），否则走 HTTP
 HEALTH_URL="http://127.0.0.1:3456/api/health"
+if [ -n "$ENV_DOMAIN" ] && sudo certbot certificates 2>/dev/null | grep -q "Certificate Name: $ENV_DOMAIN"; then
+  HEALTH_URL="https://$ENV_DOMAIN/api/health"
+fi
 info "请求: $HEALTH_URL"
 
 if command -v curl >/dev/null 2>&1; then
-  RESP=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
+  RESP=$(curl -s -o /dev/null -w "%{http_code}" -k "$HEALTH_URL" || echo "000")
   if [ "$RESP" = "200" ]; then
     info "✅ 健康检查通过 (HTTP $RESP)"
   else
@@ -216,6 +373,13 @@ cat <<'EOF'
 优雅重载:   pm2 reload mahjong-records
 数据库备份: cp data/mahjong.db data/backup-$(date +%Y%m%d).db
 
+============= Nginx / HTTPS =============
+查看配置:   sudo cat /etc/nginx/sites-available/mahjong
+验证配置:   sudo nginx -t
+reload:     sudo systemctl reload nginx
+证书状态:   sudo certbot certificates
+证书续期:   bash scripts/renew-cert.sh --auto
+
 ============= 日志轮转 (pm2-logrotate) =============
 查看配置:   pm2 conf pm2-logrotate
 查看日志:   ls -lh data/  (会看到 *.log.gz)
@@ -223,7 +387,6 @@ cat <<'EOF'
 
 ============= 下一步提醒 =============
 1. 编辑 .env 配置 WX_APPID / WX_SECRET (生产环境)
-2. 配置 Nginx 反代 + HTTPS (certbot --nginx -d api.xxx.com)
-3. 微信公众平台 → 开发管理 → 服务器域名加白名单
-4. 配置每日 3 点 DB 备份 (crontab)
+2. 微信公众平台 → 开发管理 → 服务器域名加白名单
+3. 配置每日 3 点 DB 备份 (crontab)
 EOF

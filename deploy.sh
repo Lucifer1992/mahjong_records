@@ -39,7 +39,7 @@ for arg in "$@"; do
 done
 
 # ----- 0. 环境检查 -----
-step "0/7 环境检查"
+step "0/8 环境检查"
 
 if ! command -v node &> /dev/null; then
   err "未检测到 Node.js"
@@ -66,7 +66,7 @@ fi
 info "PM2 $(pm2 -v)"
 
 # ----- 1. 拉代码 / 准备目录 -----
-step "1/7 准备代码"
+step "1/8 准备代码"
 if [ -d ".git" ]; then
   info "检测到 git 仓库,拉取最新代码..."
   git pull --rebase --autostash
@@ -76,7 +76,7 @@ else
 fi
 
 # ----- 2. 安装依赖 -----
-step "2/7 安装依赖"
+step "2/8 安装依赖"
 if [ "$MODE" = "reset" ] && [ -d "node_modules" ]; then
   warn "--reset 模式,清理 node_modules..."
   rm -rf node_modules
@@ -89,7 +89,7 @@ else
 fi
 
 # ----- 3. 配置 .env -----
-step "3/7 配置环境变量"
+step "3/8 配置环境变量"
 if [ ! -f ".env" ]; then
   cp .env.example .env
   warn ".env 已生成 (基于 .env.example)"
@@ -111,7 +111,7 @@ else
 fi
 
 # ----- 4. 初始化数据库 -----
-step "4/7 数据库"
+step "4/8 数据库"
 mkdir -p data
 
 if [ "$MODE" = "init" ] || [ "$MODE" = "reset" ]; then
@@ -128,7 +128,7 @@ else
 fi
 
 # ----- 5. 编译 -----
-step "5/7 编译 TypeScript"
+step "5/8 编译 TypeScript"
 if [ -d "dist" ] && [ "$MODE" != "reset" ]; then
   info "dist 已存在,增量编译..."
 else
@@ -143,7 +143,7 @@ fi
 info "编译产物: dist/index.js ✓"
 
 # ----- 6. PM2 启动 / 重载 -----
-step "6/7 PM2 启动"
+step "6/8 PM2 启动"
 
 if pm2 list 2>/dev/null | grep -q "mahjong-records"; then
   info "检测到已有进程,执行 graceful reload (0 停机)..."
@@ -159,8 +159,31 @@ else
   fi
 fi
 
-# ----- 7. 健康检查 -----
-step "7/7 健康检查"
+# ----- 7. 日志治理 (pm2-logrotate) -----
+step "7/8 日志治理 (pm2-logrotate)"
+
+# 幂等安装：已装则跳过
+if pm2 module:list 2>/dev/null | grep -q "pm2-logrotate"; then
+  info "pm2-logrotate 已安装,跳过安装步骤"
+else
+  info "安装 pm2-logrotate..."
+  # 用 | cat 防止某些环境 stdout 异常阻塞
+  pm2 install pm2-logrotate 2>&1 | cat || {
+    warn "pm2-logrotate 安装失败 (通常是网络问题),可手动执行: pm2 install pm2-logrotate"
+  }
+fi
+
+# 推荐配置（pm2 set 幂等）
+info "配置日志轮转参数..."
+pm2 set pm2-logrotate:max_size 10M            # 单文件 10M 触发切分
+pm2 set pm2-logrotate:retain 30               # 保留 30 份（≈ 1 个月）
+pm2 set pm2-logrotate:compress true           # 旧日志 gzip 压缩
+pm2 set pm2-logrotate:dateFormat YYYY-MM-DD-HH-mm-ss
+pm2 set pm2-logrotate:workerInterval 30       # 30 秒检查一次
+pm2 set pm2-logrotate:rotateInterval '0 0 0 * * *'  # 每日 0 点强制切
+
+# ----- 8. 健康检查 -----
+step "8/8 健康检查"
 sleep 2
 
 HEALTH_URL="http://127.0.0.1:3456/api/health"
@@ -189,6 +212,11 @@ cat <<'EOF'
 硬重启:     pm2 restart mahjong-records
 优雅重载:   pm2 reload mahjong-records
 数据库备份: cp data/mahjong.db data/backup-$(date +%Y%m%d).db
+
+============= 日志轮转 (pm2-logrotate) =============
+查看配置:   pm2 conf pm2-logrotate
+查看日志:   ls -lh data/  (会看到 *.log.gz)
+手动触发:   pm2 trigger pm2-logrotate  (测试用)
 
 ============= 下一步提醒 =============
 1. 编辑 .env 配置 WX_APPID / WX_SECRET (生产环境)

@@ -7,6 +7,14 @@
  *   pm2 reload ecosystem.config.cjs                 # 0 停机热重载
  *   pm2 logs mahjong-records                        # 查日志
  *   pm2 monit                                       # 实时监控
+ *
+ * 日志治理 (pm2-logrotate, deploy.sh 已自动安装+配置):
+ *   - 单文件 > 10M 自动切分
+ *   - 保留 30 份（≈ 1 个月），旧文件 gzip 压缩
+ *   - 每天 0 点强制切一次
+ *   查看配置: pm2 conf pm2-logrotate
+ *   查看日志: ls -lh data/  (会看到 *.log.gz)
+ *   手动触发: pm2 trigger pm2-logrotate
  */
 module.exports = {
   apps: [

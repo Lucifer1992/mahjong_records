@@ -30,6 +30,7 @@ export function initSchema(): void {
       openid        TEXT UNIQUE NOT NULL,
       nickname      TEXT NOT NULL DEFAULT '麻友',
       avatar        TEXT DEFAULT '',
+      tier          TEXT NOT NULL DEFAULT 'free',
       created_at    INTEGER NOT NULL,
       last_login_at INTEGER NOT NULL
     );
@@ -89,7 +90,25 @@ export function initSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_rp_player ON record_players(player_id);
   `);
 
+  migrateSchema();
+
   logger.info('DB schema initialized', { path: config.db.path });
+}
+
+/**
+ * 增量迁移
+ *
+ * CREATE TABLE IF NOT EXISTS 只在表不存在时生效，**不会给存量表加列**。
+ * 线上库已经有 users 表了，所以 tier 必须单独 ALTER 补一次。
+ */
+function migrateSchema(): void {
+  const columns = db.prepare('PRAGMA table_info(users)').all() as Array<{ name: string }>;
+  const hasTier = columns.some(c => c.name === 'tier');
+
+  if (!hasTier) {
+    db.exec(`ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'`);
+    logger.info('DB migration: users.tier added');
+  }
 }
 
 initSchema();

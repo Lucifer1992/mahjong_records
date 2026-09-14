@@ -15,6 +15,7 @@ import authRouter from './routes/auth';
 import recordsRouter from './routes/records';
 import playersRouter from './routes/players';
 import statsRouter from './routes/stats';
+import usersRouter from './routes/users';
 
 export function createApp(): Application {
   const app = express();
@@ -60,6 +61,7 @@ export function createApp(): Application {
   app.use('/api/records', recordsRouter);
   app.use('/api/players', playersRouter);
   app.use('/api/stats', statsRouter);
+  app.use('/api/users', usersRouter);
 
   // 404 + 错误处理
   app.use(notFound);

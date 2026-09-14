@@ -85,7 +85,14 @@ server/
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/auth/wx-login` | 微信登录，返回 token |
+| POST | `/api/auth/wx-login` | 微信登录，返回 token + 用户 `tier` |
+
+### 用户 / 等级
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/users/me` | 当前用户信息 + 等级 + 生效额度 |
+| POST | `/api/users/redeem` | 兑换码升级 Pro（body: `{ "code": "..." }`） |
 
 ### 战绩
 
@@ -94,7 +101,7 @@ server/
 | GET | `/api/records?limit=50&offset=0&ruleType=xuezhan` | 列表（分页） |
 | GET | `/api/records/:id` | 单场详情 |
 | POST | `/api/records` | 新建 |
-| POST | `/api/records/batch` | 批量同步 |
+| POST | `/api/records/batch` | 批量同步（返回 `tier` / `trimmed`） |
 | DELETE | `/api/records/:id` | 软删除 |
 
 ### 玩家
@@ -113,6 +120,31 @@ server/
 | GET | `/api/stats/summary?nickname=xxx` | 总览 |
 | GET | `/api/stats/fortune?playerId=xxx&topN=5` | 福星克星 |
 | GET | `/api/stats/calendar?year=2026&month=9&nickname=xxx` | 牌运月历 |
+
+### 免费 / 付费分层
+
+云端同步按用户等级分层，**只影响云端，本地数据永远是全量**：
+
+| 等级 | 云端保留范围 |
+|---|---|
+| `free` | **最近 N 个「有数据的日期」**（`FREE_WINDOW_DATES`，默认 3）。出现第 N+1 个日期时，最旧那天的记录被硬删除 |
+| `pro` | 全量累积，永不淘汰 |
+
+- 免费口径示例（N=3）：2.3 / 2.5 / 2.10 / 2.22 有数据 → 云端只留 2.5 / 2.10 / 2.22；再来 2.25 → 2.5 被淘汰
+- 修剪在**写入时**触发：单条 `POST /api/records` 写后修剪；`/batch` 全批插完只修剪一次
+- 日期按 **UTC+8** 切分（`TZ_OFFSET_MINUTES=480`），不是服务器本地时区
+- 升级 Pro 后再同步一次，被淘汰的记录会按 `(user_id, id)` 幂等重新上传
+
+**兑换码**是 MVP 的变现通道（小程序个人主体开不了微信支付）：
+
+```bash
+curl -X POST http://localhost:3456/api/users/redeem \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"code":"DEV-PRO"}'          # dev 环境万能码
+```
+
+> ⚠️ `PRO_UNLOCK_CODE` 留空时，**prod 环境任何人都无法自助升级**（刻意的安全默认）。
+> 将来接入支付后，把发码换成支付回调里的 `setTier(userId, 'pro')` 即可，分层逻辑不用改。
 
 ### 示例请求
 

@@ -6,6 +6,8 @@
 import { db } from '../db';
 import { uuid } from '../utils/uuid';
 import { findOrCreate } from './players';
+import { getTier } from './users';
+import { config } from '../config';
 import { BizError } from '../middleware/error';
 
 export interface PlayerScoreInput {
@@ -48,8 +50,86 @@ export interface RecordOutput {
   }>;
 }
 
-function validateInput(input: RecordInput) {
-  if (!input.playedAt || typeof input.playedAt !== 'number') {
+/**
+ * 把毫秒时间戳转成「打牌日期」键（YYYY-MM-DD）
+ *
+ * 刻意用固定时区偏移，而不是服务器本地时区：线上机器可能跑在 UTC，
+ * 按 UTC 切日期会把晚上 8 点后的牌局算到「第二天」，窗口边界就错位了。
+ * 麻将用户全在国内，UTC+8 是唯一正确解。
+ */
+function dateKey(ts: number): string {
+  const offsetMs = config.tier.tzOffsetMinutes * 60 * 1000;
+  return new Date(ts + offsetMs).toISOString().slice(0, 10);
+}
+
+/** 某个日期键当天 00:00（本地时区）对应的真实毫秒时间戳 */
+function dayStart(dayKey: string): number {
+  const offsetMs = config.tier.tzOffsetMinutes * 60 * 1000;
+  return Date.parse(`${dayKey}T00:00:00Z`) - offsetMs;
+}
+
+/**
+ * 免费用户云端窗口修剪
+ *
+ * 规则：按打牌日期去重，只保留**最近 N 个有数据的日期**的全部记录。
+ * 例（N=3，本地有 2.3 / 2.5 / 2.10 / 2.22）
+ *   → 云端只留 2.5 / 2.10 / 2.22
+ *   → 之后新增 2.25，则 2.5 被淘汰，云端变成 2.10 / 2.22 / 2.25
+ *
+ * 两个刻意的选择：
+ * 1. **硬删除**，不是软删除。软删除只标记隐藏、不省空间，也表达不出
+ *    「云端不留这段历史」的免费额度语义。
+ * 2. **只动云端，绝不动本地**。本地永远是全量；用户升级 Pro 后再同步一次，
+ *    这些被淘汰的记录会被重新上传（createRecord 按 id 幂等）。
+ *
+ * @returns 被淘汰的云端记录条数
+ */
+export function trimFreeWindow(userId: string): number {
+  const keep = config.tier.freeWindowDates;
+  if (keep <= 0) return 0;
+
+  const rows = db.prepare(
+    'SELECT played_at FROM records WHERE user_id = ? AND deleted_at IS NULL ORDER BY played_at DESC'
+  ).all(userId) as Array<{ played_at: number }>;
+  if (rows.length === 0) return 0;
+
+  const seen = new Set<string>();
+  const keepDates: string[] = [];
+  for (const r of rows) {
+    const key = dateKey(r.played_at);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (keepDates.length < keep) keepDates.push(key);
+    else break;
+  }
+
+  // 还有富余日期 → 不用淘汰
+  if (seen.size <= keep) return 0;
+
+  // 所有被淘汰的记录一定早于「最旧保留日」当天 00:00
+  const cutoff = dayStart(keepDates[keepDates.length - 1]);
+
+  const tx = db.transaction(() => {
+    db.prepare(
+      `DELETE FROM record_players WHERE record_id IN (
+         SELECT id FROM records WHERE user_id = ? AND deleted_at IS NULL AND played_at < ?
+       )`
+    ).run(userId, cutoff);
+    return db.prepare(
+      'DELETE FROM records WHERE user_id = ? AND deleted_at IS NULL AND played_at < ?'
+    ).run(userId, cutoff).changes;
+  });
+
+  return tx();
+}
+
+/** 免费用户才需要修剪；Pro 直接跳过（省掉一次全表扫描） */
+function trimIfFree(userId: string): number {
+  if (getTier(userId) === 'pro') return 0;
+  return trimFreeWindow(userId);
+}
+
+function validateInput(input: RecordInput) {  if (!input.playedAt || typeof input.playedAt !== 'number') {
     throw new BizError('BAD_REQUEST', 400, 'playedAt 必填且为数字');
   }
   if (!input.ruleType || !input.ruleName || !input.duration) {
@@ -150,9 +230,12 @@ function updatePlayerStats(recordId: string, players: PlayerScoreInput[]) {
 }
 
 /**
- * 创建战绩
+ * 写入单条战绩（**不做**免费窗口修剪）
+ *
+ * 单独拆出来，是为了让批量同步能「插完一批只修剪一次」——
+ * 否则一次 500 条的同步会触发 500 次全表扫描 + 删除。
  */
-export function createRecord(userId: string, input: RecordInput): RecordOutput {
+function insertRecord(userId: string, input: RecordInput): RecordOutput {
   validateInput(input);
 
   const recordId = input.id || uuid();
@@ -209,19 +292,33 @@ export function createRecord(userId: string, input: RecordInput): RecordOutput {
 }
 
 /**
- * 批量同步（首登 / 离线恢复）
- * 返回每条结果
+ * 创建战绩（单条入口）
+ * 写入后按用户等级修剪云端窗口：免费用户只留最近 N 个有数据的日期
+ */
+export function createRecord(userId: string, input: RecordInput): RecordOutput {
+  const out = insertRecord(userId, input);
+  trimIfFree(userId);
+  return out;
+}
+
+/**
+ * 批量同步（首登 / 离线恢复 / 用户手动「立即同步」）
+ *
+ * 全批插入完成后**只修剪一次**，并回传本次淘汰条数，
+ * 让前端能明确告诉用户"免费版云端只留了最近 3 天"。
  */
 export function batchCreate(userId: string, records: RecordInput[]): {
   success: number;
   failed: number;
   results: Array<{ id?: string; ok: boolean; error?: string }>;
+  tier: string;
+  trimmed: number;
 } {
   const results: Array<{ id?: string; ok: boolean; error?: string }> = [];
   let success = 0, failed = 0;
   for (const r of records) {
     try {
-      const out = createRecord(userId, r);
+      const out = insertRecord(userId, r);
       results.push({ id: out.id, ok: true });
       success++;
     } catch (e: any) {
@@ -229,7 +326,11 @@ export function batchCreate(userId: string, records: RecordInput[]): {
       failed++;
     }
   }
-  return { success, failed, results };
+
+  const tier = getTier(userId);
+  const trimmed = trimIfFree(userId);
+
+  return { success, failed, results, tier, trimmed };
 }
 
 /**

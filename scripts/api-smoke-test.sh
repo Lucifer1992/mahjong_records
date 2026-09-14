@@ -15,6 +15,8 @@ set -u
 BASE_URL="${BASE_URL:-http://127.0.0.1:3456}"
 TOKEN="${TOKEN:-}"
 LOGIN_CODE="${LOGIN_CODE:-smoke-test-$(date +%s)}"
+# 1 = token 由使用者提供（跑真实账号），此时禁止执行会动数据的破坏性用例
+TOKEN_FROM_ENV=0
 
 # ----- 颜色 -----
 RED='\033[0;31m'
@@ -29,8 +31,9 @@ SKIP=0
 
 info()  { echo -e "${BLUE}[INFO]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
-err()   { echo -e "${RED}[FAIL]${NC} $1"; }
-ok()    { echo -e "${GREEN}[PASS]${NC} $1"; PASS=$((PASS+1)); }
+# PASS/FAIL 走 stderr，避免 check ... >/dev/null 吞掉标签
+err()   { echo -e "${RED}[FAIL]${NC} $1" >&2; }
+ok()    { echo -e "${GREEN}[PASS]${NC} $1" >&2; PASS=$((PASS+1)); }
 skip()  { echo -e "${YELLOW}[SKIP]${NC} $1"; SKIP=$((SKIP+1)); }
 
 # ----- 单次请求 -----
@@ -54,17 +57,17 @@ check() {
   code=$(echo "$meta" | cut -d'|' -f1)
   time=$(echo "$meta" | cut -d'|' -f2)
   local data_code
-  data_code=$(echo "$body" | grep -oE '"code"\s*:\s*[-0-9]+' | head -1 | grep -oE '[-0-9]+$')
+  data_code=$(echo "$body" | grep -oE '"code"[[:space:]]*:[[:space:]]*("[^"]*"|[-0-9]+)' | head -1 | sed -E 's/"code"[[:space:]]*:[[:space:]]*//' | tr -d '"')
 
   if [[ "$code" != "$expect_code" ]]; then
     err "$name → HTTP $code (期望 $expect_code), ${time}s"
-    echo "    body: $body"
+    echo "    body: $body" >&2
     FAIL=$((FAIL+1))
     return 1
   fi
   if [[ -n "$expect_data_code" && "$data_code" != "$expect_data_code" ]]; then
     err "$name → data.code=$data_code (期望 $expect_data_code), ${time}s"
-    echo "    body: $body"
+    echo "    body: $body" >&2
     FAIL=$((FAIL+1))
     return 1
   fi
@@ -82,7 +85,9 @@ echo
 # ---------- 1. 健康检查 ----------
 echo -e "${BLUE}▶ 健康检查${NC}"
 raw=$(req GET /api/health)
-check "GET /api/health" 200 0 "$raw" >/dev/null || true
+health_body=$(check "GET /api/health" 200 0 "$raw" >/dev/null || true)
+ENV_NAME=$(echo "$health_body" | grep -oE '"env"\s*:\s*"[^"]+"' | head -1 | sed 's/.*"env"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+info "服务环境 env = ${ENV_NAME:-unknown}"
 
 # ---------- 2. 鉴权探测 ----------
 echo
@@ -97,8 +102,10 @@ check "GET /api/players (无效 token 应 401)" 401 INVALID_TOKEN "$raw" >/dev/n
 echo
 echo -e "${BLUE}▶ 登录拿 token${NC}"
 if [[ -n "$TOKEN" ]]; then
+  TOKEN_FROM_ENV=1
   info "已通过环境变量提供 TOKEN，跳过 wx-login"
 else
+  TOKEN_FROM_ENV=0
   info "尝试 wx-login (code=$LOGIN_CODE)..."
   login_payload=$(printf '{"code":"%s","nickname":"冒烟测试","avatar":""}' "$LOGIN_CODE")
   raw=$(req POST /api/auth/wx-login "$login_payload")
@@ -221,6 +228,73 @@ M=$(date +%-m)
 raw=$(req GET "/api/stats/calendar?year=$Y&month=$M" "" "$TOKEN")
 check "GET /api/stats/calendar" 200 0 "$raw" >/dev/null || true
 
+# 4.6 用户等级 / 免费云端窗口
+echo
+info "--- 用户等级 / 免费云端窗口 ---"
+
+raw=$(req GET /api/users/me "" "$TOKEN")
+me_body=$(check "GET /api/users/me" 200 0 "$raw" || true)
+MY_TIER=$(echo "$me_body" | grep -oE '"tier"\s*:\s*"[^"]+"' | head -1 | sed 's/.*"tier"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+info "当前等级 tier = ${MY_TIER:-unknown}"
+
+raw=$(req POST /api/users/redeem '{"code":"__definitely_not_a_real_code__"}' "$TOKEN")
+check "POST /api/users/redeem (无效码→400)" 400 REDEEM_FAILED "$raw" >/dev/null || true
+
+# 免费窗口修剪：造 4 个不同日期的战绩，云端应只剩最新 3 个日期
+# ⚠️ 破坏性用例：会新增/淘汰记录，因此仅在「自己 wx-login 出来的临时账号」上跑。
+#    若 TOKEN 是使用者给的（可能是真实账号），直接跳过。
+WIN_IDS=()
+if [[ "$TOKEN_FROM_ENV" -eq 1 ]]; then
+  skip "免费窗口修剪（TOKEN 由外部提供，跳过破坏性用例）"
+elif [[ "$MY_TIER" != "free" ]]; then
+  skip "免费窗口修剪（当前非免费用户，跳过）"
+else
+  WIN_NOW=$(date +%s)
+  DAY=86400
+  WIN_PAYLOAD=$(cat <<EOF
+{"records":[
+  {"id":"smoke-win-d1","playedAt":$(( (WIN_NOW - 3*DAY) * 1000 )),"ruleType":"guobiao","ruleName":"国标","duration":"evening","players":[{"nickname":"$nick","score":5},{"nickname":"wf","score":-5}]},
+  {"id":"smoke-win-d2","playedAt":$(( (WIN_NOW - 2*DAY) * 1000 )),"ruleType":"guobiao","ruleName":"国标","duration":"evening","players":[{"nickname":"$nick","score":5},{"nickname":"wf","score":-5}]},
+  {"id":"smoke-win-d3","playedAt":$(( (WIN_NOW - 1*DAY) * 1000 )),"ruleType":"guobiao","ruleName":"国标","duration":"evening","players":[{"nickname":"$nick","score":5},{"nickname":"wf","score":-5}]},
+  {"id":"smoke-win-d4","playedAt":$(( WIN_NOW * 1000 )),"ruleType":"guobiao","ruleName":"国标","duration":"evening","players":[{"nickname":"$nick","score":5},{"nickname":"wf","score":-5}]}
+]}
+EOF
+)
+  WIN_IDS=(smoke-win-d2 smoke-win-d3 smoke-win-d4)
+  raw=$(req POST /api/records/batch "$WIN_PAYLOAD" "$TOKEN")
+  win_body=$(check "POST /api/records/batch (4 个不同日期)" 200 0 "$raw" || true)
+  TRIMMED=$(echo "$win_body" | grep -oE '"trimmed"\s*:\s*[0-9]+' | head -1 | sed 's/.*:[[:space:]]*//')
+
+  if [[ "$TRIMMED" == "1" ]]; then
+    ok "免费窗口修剪 → 淘汰最旧那天 1 条 (trimmed=1)"
+  else
+    err "免费窗口修剪 → 期望 trimmed=1，实际 ${TRIMMED:-N/A}"
+    FAIL=$((FAIL+1))
+  fi
+
+  # 被淘汰的那条必须真的查不到了
+  raw=$(req GET "/api/records/smoke-win-d1" "" "$TOKEN")
+  check "GET 被淘汰记录 (应 404)" 404 NOT_FOUND "$raw" >/dev/null || true
+fi
+
+# dev 环境下验收「兑换码 → Pro」闭环（跑完这个账号就变 pro 了，故放最后）
+if [[ "$TOKEN_FROM_ENV" -eq 0 && "$ENV_NAME" == "development" && "$MY_TIER" == "free" ]]; then
+  raw=$(req POST /api/users/redeem '{"code":"DEV-PRO"}' "$TOKEN")
+  check "POST /api/users/redeem (dev 万能码)" 200 0 "$raw" >/dev/null || true
+
+  raw=$(req GET /api/users/me "" "$TOKEN")
+  pro_body=$(check "GET /api/users/me (升级后)" 200 0 "$raw" || true)
+  NOW_TIER=$(echo "$pro_body" | grep -oE '"tier"\s*:\s*"[^"]+"' | head -1 | sed 's/.*"tier"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+  if [[ "$NOW_TIER" == "pro" ]]; then
+    ok "兑换码升级 → tier=pro"
+  else
+    err "兑换码升级 → 期望 tier=pro，实际 ${NOW_TIER:-N/A}"
+    FAIL=$((FAIL+1))
+  fi
+else
+  skip "兑换码升级（非 dev 环境 或 使用了外部 TOKEN）"
+fi
+
 # ---------- 5. 清理 ----------
 echo
 echo -e "${BLUE}▶ 清理测试数据${NC}"
@@ -231,6 +305,14 @@ fi
 if [[ -n "$PLAYER_ID" ]]; then
   raw=$(req DELETE "/api/players/$PLAYER_ID" "" "$TOKEN")
   check "DELETE /api/players/:id" 200 0 "$raw" >/dev/null || true
+fi
+
+# 免费窗口用例留下的记录
+if [[ ${#WIN_IDS[@]} -gt 0 ]]; then
+  for wid in "${WIN_IDS[@]}"; do
+    req DELETE "/api/records/$wid" "" "$TOKEN" >/dev/null 2>&1 || true
+  done
+  info "已清理免费窗口用例的 ${#WIN_IDS[@]} 条记录"
 fi
 
 # ---------- 汇总 ----------

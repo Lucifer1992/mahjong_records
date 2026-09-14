@@ -26,7 +26,8 @@ router.post('/wx-login', async (req, res, next) => {
         user: {
           id: user.id,
           nickname: user.nickname,
-          avatar: user.avatar
+          avatar: user.avatar,
+          tier: user.tier
         }
       }
     });

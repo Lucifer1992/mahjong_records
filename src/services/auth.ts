@@ -5,12 +5,14 @@ import { db } from '../db';
 import { uuid } from '../utils/uuid';
 import { config } from '../config';
 import { logger } from '../logger';
+import { normalizeTier, type Tier } from './users';
 
 export interface User {
   id: string;
   openid: string;
   nickname: string;
   avatar: string;
+  tier: Tier;
 }
 
 /**
@@ -48,19 +50,27 @@ export async function login(code: string, nickname?: string, avatar?: string): P
     throw new Error('login failed: cannot resolve openid');
   }
 
-  const existing = db.prepare('SELECT * FROM users WHERE openid = ?').get(openid) as User | undefined;
+  const existing = db.prepare('SELECT * FROM users WHERE openid = ?').get(openid) as
+    | (Omit<User, 'tier'> & { tier?: string })
+    | undefined;
   if (existing) {
     db.prepare('UPDATE users SET last_login_at = ?, nickname = COALESCE(?, nickname), avatar = COALESCE(?, avatar) WHERE id = ?')
       .run(Date.now(), nickname ?? null, avatar ?? null, existing.id);
-    return { ...existing, last_login_at: Date.now() } as User;
+    return {
+      id: existing.id,
+      openid: existing.openid,
+      nickname: existing.nickname,
+      avatar: existing.avatar,
+      tier: normalizeTier(existing.tier)
+    };
   }
 
   const id = uuid();
   const now = Date.now();
   db.prepare(`
-    INSERT INTO users (id, openid, nickname, avatar, created_at, last_login_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(id, openid, nickname || '麻友', avatar || '', now, now);
+    INSERT INTO users (id, openid, nickname, avatar, tier, created_at, last_login_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(id, openid, nickname || '麻友', avatar || '', 'free', now, now);
 
-  return { id, openid, nickname: nickname || '麻友', avatar: avatar || '' };
+  return { id, openid, nickname: nickname || '麻友', avatar: avatar || '', tier: 'free' };
 }

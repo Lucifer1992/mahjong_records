@@ -67,6 +67,37 @@ export const config = {
     tzOffsetMinutes: num(process.env.TZ_OFFSET_MINUTES, 480)
   },
 
+  // 虚拟支付（wx.requestVirtualPayment，与普通微信支付是两套独立商户号）
+  vpay: {
+    /** 虚拟支付商户号（MP 后台 → 虚拟支付 → 基本配置） */
+    offerId: str(process.env.VPAY_OFFER_ID, '1450649440'),
+    /** 沙箱 AppKey（测试环境签名密钥） */
+    sandboxAppKey: str(process.env.VPAY_SANDBOX_APP_KEY, '16WSLCnFyi2G8mHXkPxvTimiRjRCt6pw'),
+    /**
+     * ⚠️ 现网 AppKey —— 真实收款的签名密钥，泄露即可被伪造支付签名。
+     * 刻意不预置、不进 git：部署时由铁匠手动填服务器 .env 的 VPAY_PROD_APP_KEY。
+     */
+    prodAppKey: str(process.env.VPAY_PROD_APP_KEY, ''),
+    /** 0 = 现网，1 = 沙箱。联调用 1，上线切 0 */
+    env: num(process.env.VPAY_ENV, 1),
+    products: {
+      lifetime: {
+        productId: str(process.env.VPAY_PRODUCT_LIFETIME, 'PRO_LIFETIME'),
+        priceFen: num(process.env.VPAY_PRICE_LIFETIME, 6800), // ¥68，单位：分
+        label: 'Pro 终身'
+      },
+      yearly: {
+        productId: str(process.env.VPAY_PRODUCT_YEARLY, 'PRO_YEARLY'),
+        priceFen: num(process.env.VPAY_PRICE_YEARLY, 2800), // ¥28，单位：分
+        label: 'Pro 年卡'
+      }
+    },
+    /** MP 后台「消息推送」配置的 Token（GET 握手 + 推送签名校验），与后台保持一致 */
+    pushToken: str(process.env.VPAY_PUSH_TOKEN, ''),
+    /** MP 后台「消息推送」的 EncodingAESKey（43 位，安全模式解密用），与后台保持一致 */
+    aesKey: str(process.env.VPAY_AES_KEY, '')
+  },
+
   isDev(): boolean {
     return this.env === 'development';
   },

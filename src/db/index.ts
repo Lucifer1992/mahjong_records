@@ -31,10 +31,26 @@ export function initSchema(): void {
       nickname      TEXT NOT NULL DEFAULT '麻友',
       avatar        TEXT DEFAULT '',
       tier          TEXT NOT NULL DEFAULT 'free',
+      session_key   TEXT DEFAULT '',
       created_at    INTEGER NOT NULL,
       last_login_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_users_openid ON users(openid);
+
+    -- 虚拟支付订单（wx.requestVirtualPayment 道具直购）
+    CREATE TABLE IF NOT EXISTS vpay_orders (
+      id           TEXT PRIMARY KEY,
+      user_id      TEXT NOT NULL,
+      out_trade_no TEXT UNIQUE NOT NULL,
+      product_key  TEXT NOT NULL,              -- lifetime / yearly
+      product_id   TEXT NOT NULL,              -- 后台道具 ID，如 PRO_LIFETIME
+      price_fen    INTEGER NOT NULL,           -- 下单时价格快照（分）
+      status       TEXT NOT NULL DEFAULT 'created',  -- created / paid
+      created_at   INTEGER NOT NULL,
+      paid_at      INTEGER,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_vpay_orders_user ON vpay_orders(user_id);
 
     -- 玩家档案（一个 user 可以有很多 player；跨局通用）
     CREATE TABLE IF NOT EXISTS players (
@@ -104,10 +120,16 @@ export function initSchema(): void {
 function migrateSchema(): void {
   const columns = db.prepare('PRAGMA table_info(users)').all() as Array<{ name: string }>;
   const hasTier = columns.some(c => c.name === 'tier');
+  const hasSessionKey = columns.some(c => c.name === 'session_key');
 
   if (!hasTier) {
     db.exec(`ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'`);
     logger.info('DB migration: users.tier added');
+  }
+  // 虚拟支付 signature = HMAC-SHA256(session_key, signData)，服务端必须持久化 session_key
+  if (!hasSessionKey) {
+    db.exec(`ALTER TABLE users ADD COLUMN session_key TEXT DEFAULT ''`);
+    logger.info('DB migration: users.session_key added');
   }
 }
 

@@ -1,136 +1,198 @@
 /**
- * SQLite 数据库连接 + 建表
- * 使用 better-sqlite3（同步 API、性能最好、零依赖）
+ * MySQL 连接池 + 建表（mysql2/promise）
+ *
+ * 设计约定：
+ * - 时间戳统一存毫秒 BIGINT，不用 DATETIME → 彻底规避时区换算问题
+ * - 会话时区固定 UTC+8：仅影响 FROM_UNIXTIME 的"打牌日"分组（月历），
+ *   与前端/修剪窗口（TZ_OFFSET_MINUTES=480）语义一致
+ * - 轻封装 query / queryOne / exec / withTransaction，贴近旧 better-sqlite3
+ *   的调用习惯，services 迁移 diff 最小
  */
-import Database from 'better-sqlite3';
-import fs from 'fs';
-import path from 'path';
+import mysql from 'mysql2/promise';
 import { config } from '../config';
 import { logger } from '../logger';
 
-// 确保目录
-const dbDir = path.dirname(config.db.path);
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
+export const pool = mysql.createPool({
+  host: config.mysql.host,
+  port: config.mysql.port,
+  user: config.mysql.user,
+  password: config.mysql.password,
+  database: config.mysql.database,
+  waitForConnections: true,
+  connectionLimit: config.mysql.connectionLimit,
+  charset: 'utf8mb4'
+});
+
+// 每条连接固定会话时区（月历按打牌日分组依赖 FROM_UNIXTIME）
+pool.on('connection', (conn) => {
+  conn.query("SET time_zone = '+08:00'");
+});
+
+// ---------- 轻封装 ----------
+
+export async function query<T = any>(sql: string, params: any[] = []): Promise<T[]> {
+  const [rows] = await pool.query(sql, params);
+  return rows as T[];
 }
 
-export const db = new Database(config.db.path);
-db.pragma('journal_mode = WAL');        // 提升并发读写
-db.pragma('foreign_keys = ON');        // 启用外键约束
-db.pragma('synchronous = NORMAL');     // 性能/安全平衡
+export async function queryOne<T = any>(sql: string, params: any[] = []): Promise<T | undefined> {
+  const rows = await query<T>(sql, params);
+  return rows[0];
+}
 
-/**
- * 初始化表结构
- */
-export function initSchema(): void {
-  db.exec(`
-    -- 用户（微信小程序登录）
-    CREATE TABLE IF NOT EXISTS users (
-      id            TEXT PRIMARY KEY,
-      openid        TEXT UNIQUE NOT NULL,
-      nickname      TEXT NOT NULL DEFAULT '麻友',
-      avatar        TEXT DEFAULT '',
-      tier          TEXT NOT NULL DEFAULT 'free',
-      session_key   TEXT DEFAULT '',
-      created_at    INTEGER NOT NULL,
-      last_login_at INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_users_openid ON users(openid);
+export interface ExecResult {
+  affectedRows: number;
+  insertId: number;
+}
 
-    -- 虚拟支付订单（wx.requestVirtualPayment 道具直购）
-    CREATE TABLE IF NOT EXISTS vpay_orders (
-      id           TEXT PRIMARY KEY,
-      user_id      TEXT NOT NULL,
-      out_trade_no TEXT UNIQUE NOT NULL,
-      product_key  TEXT NOT NULL,              -- lifetime / yearly
-      product_id   TEXT NOT NULL,              -- 后台道具 ID，如 PRO_LIFETIME
-      price_fen    INTEGER NOT NULL,           -- 下单时价格快照（分）
-      status       TEXT NOT NULL DEFAULT 'created',  -- created / paid
-      created_at   INTEGER NOT NULL,
-      paid_at      INTEGER,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS idx_vpay_orders_user ON vpay_orders(user_id);
+export async function exec(sql: string, params: any[] = []): Promise<ExecResult> {
+  const [result] = await pool.query(sql, params);
+  const r = result as any;
+  return { affectedRows: r.affectedRows ?? 0, insertId: r.insertId ?? 0 };
+}
 
-    -- 玩家档案（一个 user 可以有很多 player；跨局通用）
-    CREATE TABLE IF NOT EXISTS players (
-      id                TEXT PRIMARY KEY,
-      user_id           TEXT NOT NULL,
-      nickname          TEXT NOT NULL,
-      color             TEXT NOT NULL DEFAULT '#4A9D7E',
-      created_at        INTEGER NOT NULL,
-      total_games       INTEGER NOT NULL DEFAULT 0,
-      total_score       INTEGER NOT NULL DEFAULT 0,
-      win_rate          REAL NOT NULL DEFAULT 0,
-      max_win_streak    INTEGER NOT NULL DEFAULT 0,
-      max_lose_streak   INTEGER NOT NULL DEFAULT 0,
-      current_streak    INTEGER NOT NULL DEFAULT 0,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS idx_players_user ON players(user_id);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_players_user_nickname ON players(user_id, nickname);
+/** 事务：回调内所有 SQL 用同一个 conn，异常自动回滚 */
+export async function withTransaction<T>(fn: (conn: mysql.PoolConnection) => Promise<T>): Promise<T> {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const out = await fn(conn);
+    await conn.commit();
+    return out;
+  } catch (e) {
+    try { await conn.rollback(); } catch { /* ignore */ }
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
 
-    -- 战绩主表（软删除：deleted_at 不为空即视为已删除）
-    CREATE TABLE IF NOT EXISTS records (
-      id          TEXT PRIMARY KEY,
-      user_id     TEXT NOT NULL,
-      played_at   INTEGER NOT NULL,
-      rule_type   TEXT NOT NULL,
-      rule_name   TEXT NOT NULL,
-      duration    TEXT NOT NULL,
-      total_fee   INTEGER NOT NULL DEFAULT 0,
-      note        TEXT DEFAULT '',
-      mood        TEXT,
-      created_at  INTEGER NOT NULL,
-      updated_at  INTEGER NOT NULL,
-      deleted_at  INTEGER DEFAULT NULL,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS idx_records_user_played ON records(user_id, played_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_records_user_active ON records(user_id, deleted_at, played_at DESC);
+/** 统一入口：services 里 import { db } 后 db.query / db.exec / db.withTransaction */
+export const db = {
+  pool,
+  query,
+  queryOne,
+  exec,
+  withTransaction
+};
 
-    -- 战绩-玩家关联（含分数 / 替补 / 观战）
-    CREATE TABLE IF NOT EXISTS record_players (
-      id            TEXT PRIMARY KEY,
-      record_id     TEXT NOT NULL,
-      player_id     TEXT NOT NULL,
-      nickname      TEXT NOT NULL,
-      score         INTEGER NOT NULL DEFAULT 0,
-      is_substitute INTEGER NOT NULL DEFAULT 0,
-      is_observer   INTEGER NOT NULL DEFAULT 0,
-      sort_order    INTEGER NOT NULL DEFAULT 0,
-      FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE,
-      FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS idx_rp_record ON record_players(record_id);
-    CREATE INDEX IF NOT EXISTS idx_rp_player ON record_players(player_id);
-  `);
+// ---------- 建表 ----------
 
-  migrateSchema();
+const DDL = `
+  CREATE TABLE IF NOT EXISTS users (
+    id            VARCHAR(36)  PRIMARY KEY,
+    openid        VARCHAR(64)  NOT NULL,
+    nickname      VARCHAR(64)  NOT NULL DEFAULT '麻友',
+    avatar        VARCHAR(500) NOT NULL DEFAULT '',
+    tier          VARCHAR(16)  NOT NULL DEFAULT 'free',
+    session_key   VARCHAR(128) NOT NULL DEFAULT '',
+    created_at    BIGINT       NOT NULL,
+    last_login_at BIGINT       NOT NULL,
+    UNIQUE KEY uk_users_openid (openid)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-  logger.info('DB schema initialized', { path: config.db.path });
+  CREATE TABLE IF NOT EXISTS players (
+    id              VARCHAR(36) PRIMARY KEY,
+    user_id         VARCHAR(36) NOT NULL,
+    nickname        VARCHAR(64) NOT NULL,
+    color           VARCHAR(16) NOT NULL DEFAULT '#4A9D7E',
+    created_at      BIGINT      NOT NULL,
+    total_games     INT         NOT NULL DEFAULT 0,
+    total_score     INT         NOT NULL DEFAULT 0,
+    win_rate        DOUBLE      NOT NULL DEFAULT 0,
+    max_win_streak  INT         NOT NULL DEFAULT 0,
+    max_lose_streak INT         NOT NULL DEFAULT 0,
+    current_streak  INT         NOT NULL DEFAULT 0,
+    UNIQUE KEY uk_players_user_nickname (user_id, nickname),
+    KEY idx_players_user (user_id),
+    CONSTRAINT fk_players_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+  CREATE TABLE IF NOT EXISTS records (
+    id         VARCHAR(36) PRIMARY KEY,
+    user_id    VARCHAR(36) NOT NULL,
+    played_at  BIGINT      NOT NULL,
+    rule_type  VARCHAR(32) NOT NULL,
+    rule_name  VARCHAR(64) NOT NULL,
+    duration   VARCHAR(16) NOT NULL,
+    total_fee  INT         NOT NULL DEFAULT 0,
+    note       VARCHAR(255) NOT NULL DEFAULT '',
+    mood       VARCHAR(16) NULL,
+    created_at BIGINT      NOT NULL,
+    updated_at BIGINT      NOT NULL,
+    deleted_at BIGINT      NULL,
+    KEY idx_records_user_played (user_id, played_at),
+    KEY idx_records_user_active (user_id, deleted_at, played_at),
+    CONSTRAINT fk_records_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+  CREATE TABLE IF NOT EXISTS record_players (
+    id            VARCHAR(36) PRIMARY KEY,
+    record_id     VARCHAR(36) NOT NULL,
+    player_id     VARCHAR(36) NOT NULL,
+    nickname      VARCHAR(64) NOT NULL,
+    score         INT         NOT NULL DEFAULT 0,
+    is_substitute TINYINT     NOT NULL DEFAULT 0,
+    is_observer   TINYINT     NOT NULL DEFAULT 0,
+    sort_order    INT         NOT NULL DEFAULT 0,
+    KEY idx_rp_record (record_id),
+    KEY idx_rp_player (player_id),
+    -- 注意：player_id 故意不设外键 —— record_players 是历史快照表
+    -- （nickname 冗余存储），删玩家档案不应连带删掉历史战绩快照
+    CONSTRAINT fk_rp_record FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+  CREATE TABLE IF NOT EXISTS vpay_orders (
+    id           VARCHAR(36) PRIMARY KEY,
+    user_id      VARCHAR(36) NOT NULL,
+    out_trade_no VARCHAR(40) NOT NULL,
+    product_key  VARCHAR(32) NOT NULL,
+    product_id   VARCHAR(64) NOT NULL,
+    price_fen    INT         NOT NULL,
+    status       VARCHAR(16) NOT NULL DEFAULT 'created',
+    created_at   BIGINT      NOT NULL,
+    paid_at      BIGINT      NULL,
+    UNIQUE KEY uk_vpay_out_trade_no (out_trade_no),
+    KEY idx_vpay_orders_user (user_id),
+    CONSTRAINT fk_vpay_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+`;
+
+export async function initSchema(): Promise<void> {
+  // 多语句 DDL：mysql2 query 默认可执行多语句? —— 保险起见逐段执行
+  for (const stmt of DDL.split(';')) {
+    const sql = stmt.trim();
+    if (sql) await pool.query(sql);
+  }
+  await migrateSchema();
+  logger.info('MySQL schema initialized', { host: config.mysql.host, database: config.mysql.database });
 }
 
 /**
- * 增量迁移
- *
- * CREATE TABLE IF NOT EXISTS 只在表不存在时生效，**不会给存量表加列**。
- * 线上库已经有 users 表了，所以 tier 必须单独 ALTER 补一次。
+ * 增量列迁移（CREATE TABLE IF NOT EXISTS 不会给存量表加列）
+ * 用 information_schema 检查后 ALTER
  */
-function migrateSchema(): void {
-  const columns = db.prepare('PRAGMA table_info(users)').all() as Array<{ name: string }>;
-  const hasTier = columns.some(c => c.name === 'tier');
-  const hasSessionKey = columns.some(c => c.name === 'session_key');
+async function migrateSchema(): Promise<void> {
+  const cols = await query<{ COLUMN_NAME: string }>(
+    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'users'`,
+    [config.mysql.database]
+  );
+  const names = new Set(cols.map(c => c.COLUMN_NAME));
 
-  if (!hasTier) {
-    db.exec(`ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'`);
-    logger.info('DB migration: users.tier added');
+  if (!names.has('tier')) {
+    await pool.query(`ALTER TABLE users ADD COLUMN tier VARCHAR(16) NOT NULL DEFAULT 'free'`);
+    logger.info('MySQL migration: users.tier added');
   }
   // 虚拟支付 signature = HMAC-SHA256(session_key, signData)，服务端必须持久化 session_key
-  if (!hasSessionKey) {
-    db.exec(`ALTER TABLE users ADD COLUMN session_key TEXT DEFAULT ''`);
-    logger.info('DB migration: users.session_key added');
+  if (!names.has('session_key')) {
+    await pool.query(`ALTER TABLE users ADD COLUMN session_key VARCHAR(128) NOT NULL DEFAULT ''`);
+    logger.info('MySQL migration: users.session_key added');
   }
 }
 
-initSchema();
+// 启动即初始化（连不上直接退出，让 PM2 拉起重试）
+initSchema().catch((e) => {
+  logger.error('MySQL init failed —— 请检查 MYSQL_* 配置', { err: (e as Error).message });
+  process.exit(1);
+});

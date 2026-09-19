@@ -1,5 +1,5 @@
 /**
- * 用户 / 登录业务
+ * 用户 / 登录业务（MySQL 异步版）
  */
 import { db } from '../db';
 import { uuid } from '../utils/uuid';
@@ -54,17 +54,19 @@ export async function login(code: string, nickname?: string, avatar?: string): P
     throw new Error('login failed: cannot resolve openid');
   }
 
-  const existing = db.prepare('SELECT * FROM users WHERE openid = ?').get(openid) as
-    | (Omit<User, 'tier'> & { tier?: string; session_key?: string })
-    | undefined;
+  const existing = await db.queryOne<any>('SELECT * FROM users WHERE openid = ?', [openid]);
   if (existing) {
     if (sessionKey) {
       // 新的 session_key 覆盖旧值；拿不到（理论上不会）就保留旧值
-      db.prepare('UPDATE users SET last_login_at = ?, nickname = COALESCE(?, nickname), avatar = COALESCE(?, avatar), session_key = ? WHERE id = ?')
-        .run(Date.now(), nickname ?? null, avatar ?? null, sessionKey, existing.id);
+      await db.exec(
+        'UPDATE users SET last_login_at = ?, nickname = COALESCE(?, nickname), avatar = COALESCE(?, avatar), session_key = ? WHERE id = ?',
+        [Date.now(), nickname ?? null, avatar ?? null, sessionKey, existing.id]
+      );
     } else {
-      db.prepare('UPDATE users SET last_login_at = ?, nickname = COALESCE(?, nickname), avatar = COALESCE(?, avatar) WHERE id = ?')
-        .run(Date.now(), nickname ?? null, avatar ?? null, existing.id);
+      await db.exec(
+        'UPDATE users SET last_login_at = ?, nickname = COALESCE(?, nickname), avatar = COALESCE(?, avatar) WHERE id = ?',
+        [Date.now(), nickname ?? null, avatar ?? null, existing.id]
+      );
     }
     return {
       id: existing.id,
@@ -77,18 +79,20 @@ export async function login(code: string, nickname?: string, avatar?: string): P
 
   const id = uuid();
   const now = Date.now();
-  db.prepare(`
-    INSERT INTO users (id, openid, nickname, avatar, tier, session_key, created_at, last_login_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, openid, nickname || '麻友', avatar || '', 'free', sessionKey, now, now);
+  await db.exec(
+    `INSERT INTO users (id, openid, nickname, avatar, tier, session_key, created_at, last_login_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, openid, nickname || '麻友', avatar || '', 'free', sessionKey, now, now]
+  );
 
   return { id, openid, nickname: nickname || '麻友', avatar: avatar || '', tier: 'free' };
 }
 
 /** 读取用户当前 session_key（虚拟支付签名用；可能为空 = 需重新登录） */
-export function getSessionKey(userId: string): string {
-  const row = db.prepare('SELECT session_key FROM users WHERE id = ?').get(userId) as
-    | { session_key?: string }
-    | undefined;
+export async function getSessionKey(userId: string): Promise<string> {
+  const row = await db.queryOne<{ session_key: string }>(
+    'SELECT session_key FROM users WHERE id = ?',
+    [userId]
+  );
   return row?.session_key || '';
 }

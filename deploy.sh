@@ -146,22 +146,29 @@ else
   info "API_DOMAIN = $ENV_DOMAIN (步骤 8/9 将自动配置 Nginx + HTTPS)"
 fi
 
-# ----- 4. 初始化数据库 -----
+# ----- 4. 初始化数据库（MySQL） -----
 step "4/10 数据库"
-mkdir -p data
 
-if [ "$MODE" = "init" ] || [ "$MODE" = "reset" ]; then
-  if [ -f "data/mahjong.db" ]; then
-    warn "备份现有数据库: data/mahjong.db -> data/mahjong.db.bak.$(date +%Y%m%d%H%M%S)"
-    cp data/mahjong.db "data/mahjong.db.bak.$(date +%Y%m%d%H%M%S)"
-  fi
-  npm run init-db
-elif [ ! -f "data/mahjong.db" ]; then
-  info "首次运行,初始化数据库..."
-  npm run init-db
-else
-  info "data/mahjong.db 已存在,跳过建表"
+# .env 里必须有 MYSQL_* 配置
+if ! grep -qE "^MYSQL_DATABASE=" .env; then
+  err ".env 缺少 MYSQL_DATABASE 配置！"
+  echo "   首次部署请先在服务器上执行: sudo bash scripts/setup-mysql.sh addapp mahjong_records mahjong_rw"
+  echo "   然后把生成的凭据填入 .env 的 MYSQL_HOST / MYSQL_DATABASE / MYSQL_USER / MYSQL_PASSWORD"
+  exit 1
 fi
+
+# 存量迁移提示（SQLite → MySQL 一次性）
+if [ -f "data/mahjong.db" ]; then
+  warn "检测到旧 SQLite 库 data/mahjong.db"
+  warn "如尚未迁移存量数据，请在部署完成后执行一次: npm run migrate-sqlite"
+fi
+
+# init-db 幂等：连库 + 建表 + 列迁移，失败即退出
+if ! npm run init-db; then
+  err "数据库初始化失败，请检查 .env 的 MYSQL_* 配置与 MySQL 服务状态"
+  exit 1
+fi
+info "✅ MySQL 连接与建表验证通过"
 
 # ----- 5. 编译 -----
 step "5/10 编译 TypeScript"
@@ -388,5 +395,5 @@ reload:     sudo systemctl reload nginx
 ============= 下一步提醒 =============
 1. 编辑 .env 配置 WX_APPID / WX_SECRET (生产环境)
 2. 微信公众平台 → 开发管理 → 服务器域名加白名单
-3. 配置每日 3 点 DB 备份 (crontab)
+3. 配置每日 3 点 DB 备份 (crontab + mysqldump)
 EOF

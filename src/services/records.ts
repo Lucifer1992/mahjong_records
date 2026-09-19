@@ -1,11 +1,13 @@
 /**
- * 战绩业务
+ * 战绩业务（MySQL 异步版）
  * - 单条 / 批量写入（自动创建/更新玩家档案）
  * - 软删除（保留玩家统计稳定）
+ * - 免费云端窗口修剪（硬删除，只动云端）
  */
 import { db } from '../db';
+import type { PoolConnection } from 'mysql2/promise';
 import { uuid } from '../utils/uuid';
-import { findOrCreate } from './players';
+import { findOrCreate, findOrCreateByConn } from './players';
 import { getTier } from './users';
 import { config } from '../config';
 import { BizError } from '../middleware/error';
@@ -72,31 +74,26 @@ function dayStart(dayKey: string): number {
  * 免费用户云端窗口修剪
  *
  * 规则：按打牌日期去重，只保留**最近 N 个有数据的日期**的全部记录。
- * 例（N=3，本地有 2.3 / 2.5 / 2.10 / 2.22）
- *   → 云端只留 2.5 / 2.10 / 2.22
- *   → 之后新增 2.25，则 2.5 被淘汰，云端变成 2.10 / 2.22 / 2.25
- *
  * 两个刻意的选择：
- * 1. **硬删除**，不是软删除。软删除只标记隐藏、不省空间，也表达不出
- *    「云端不留这段历史」的免费额度语义。
- * 2. **只动云端，绝不动本地**。本地永远是全量；用户升级 Pro 后再同步一次，
- *    这些被淘汰的记录会被重新上传（createRecord 按 id 幂等）。
+ * 1. **硬删除**，不是软删除 —— 表达「云端不留这段历史」的免费额度语义
+ * 2. **只动云端，绝不动本地** —— 升级 Pro 后再同步，记录按 id 幂等重新上传
  *
  * @returns 被淘汰的云端记录条数
  */
-export function trimFreeWindow(userId: string): number {
+export async function trimFreeWindow(userId: string): Promise<number> {
   const keep = config.tier.freeWindowDates;
   if (keep <= 0) return 0;
 
-  const rows = db.prepare(
-    'SELECT played_at FROM records WHERE user_id = ? AND deleted_at IS NULL ORDER BY played_at DESC'
-  ).all(userId) as Array<{ played_at: number }>;
+  const rows = await db.query<{ played_at: number }>(
+    'SELECT played_at FROM records WHERE user_id = ? AND deleted_at IS NULL ORDER BY played_at DESC',
+    [userId]
+  );
   if (rows.length === 0) return 0;
 
   const seen = new Set<string>();
   const keepDates: string[] = [];
   for (const r of rows) {
-    const key = dateKey(r.played_at);
+    const key = dateKey(Number(r.played_at));
     if (seen.has(key)) continue;
     seen.add(key);
     if (keepDates.length < keep) keepDates.push(key);
@@ -109,27 +106,25 @@ export function trimFreeWindow(userId: string): number {
   // 所有被淘汰的记录一定早于「最旧保留日」当天 00:00
   const cutoff = dayStart(keepDates[keepDates.length - 1]);
 
-  const tx = db.transaction(() => {
-    db.prepare(
-      `DELETE FROM record_players WHERE record_id IN (
-         SELECT id FROM records WHERE user_id = ? AND deleted_at IS NULL AND played_at < ?
-       )`
-    ).run(userId, cutoff);
-    return db.prepare(
-      'DELETE FROM records WHERE user_id = ? AND deleted_at IS NULL AND played_at < ?'
-    ).run(userId, cutoff).changes;
+  // record_players.record_id 已设 ON DELETE CASCADE（见 db/index.ts），
+  // 删 records 会自动级联到 record_players，无需手动删子表
+  return db.withTransaction(async (conn) => {
+    const [result] = await conn.query(
+      'DELETE FROM records WHERE user_id = ? AND deleted_at IS NULL AND played_at < ?',
+      [userId, cutoff]
+    );
+    return (result as any).affectedRows ?? 0;
   });
-
-  return tx();
 }
 
 /** 免费用户才需要修剪；Pro 直接跳过（省掉一次全表扫描） */
-function trimIfFree(userId: string): number {
-  if (getTier(userId) === 'pro') return 0;
+async function trimIfFree(userId: string): Promise<number> {
+  if (await getTier(userId) === 'pro') return 0;
   return trimFreeWindow(userId);
 }
 
-function validateInput(input: RecordInput) {  if (!input.playedAt || typeof input.playedAt !== 'number') {
+function validateInput(input: RecordInput) {
+  if (!input.playedAt || typeof input.playedAt !== 'number') {
     throw new BizError('BAD_REQUEST', 400, 'playedAt 必填且为数字');
   }
   if (!input.ruleType || !input.ruleName || !input.duration) {
@@ -151,27 +146,29 @@ function validateInput(input: RecordInput) {  if (!input.playedAt || typeof inpu
 /**
  * 加载完整战绩（含玩家列表）
  */
-function loadRecord(userId: string, recordId: string): RecordOutput | null {
-  const r = db.prepare(
-    'SELECT * FROM records WHERE user_id = ? AND id = ? AND deleted_at IS NULL'
-  ).get(userId, recordId) as any;
+async function loadRecord(userId: string, recordId: string): Promise<RecordOutput | null> {
+  const r = await db.queryOne<any>(
+    'SELECT * FROM records WHERE user_id = ? AND id = ? AND deleted_at IS NULL',
+    [userId, recordId]
+  );
   if (!r) return null;
 
-  const players = db.prepare(
-    'SELECT player_id, nickname, score, is_substitute, is_observer FROM record_players WHERE record_id = ? ORDER BY sort_order ASC'
-  ).all(recordId) as any[];
+  const players = await db.query<any>(
+    'SELECT player_id, nickname, score, is_substitute, is_observer FROM record_players WHERE record_id = ? ORDER BY sort_order ASC',
+    [recordId]
+  );
 
   return {
     id: r.id,
-    playedAt: r.played_at,
+    playedAt: Number(r.played_at),
     ruleType: r.rule_type,
     ruleName: r.rule_name,
     duration: r.duration,
     totalFee: r.total_fee,
     note: r.note || '',
     mood: r.mood,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
+    createdAt: Number(r.created_at),
+    updatedAt: Number(r.updated_at),
     players: players.map(p => ({
       playerId: p.player_id,
       nickname: p.nickname,
@@ -183,50 +180,85 @@ function loadRecord(userId: string, recordId: string): RecordOutput | null {
 }
 
 /**
- * 正向更新玩家战绩统计（写入战绩后调用）
+ * 正向更新玩家战绩统计（写入战绩后调用；必须在事务内用 conn）
+ *
+ * 性能：之前每个玩家一次 SELECT + 一次 UPDATE，单局 4-8 人 = 8-16 次往返；
+ * 现在每个玩家只一次 SELECT，UPDATE 合并为单条 CASE/WHEN。
  */
-function updatePlayerStats(recordId: string, players: PlayerScoreInput[]) {
-  // 找最高分者
-  let maxScore = -Infinity;
-  for (const p of players) if (p.score > maxScore) maxScore = p.score;
+async function updatePlayerStats(conn: PoolConnection, players: PlayerScoreInput[]) {
+  if (players.length === 0) return;
+
+  // 每局内 score>0 算胜，多人赢时按均摊累加（保持原有语义）
+  const winnerCount = players.filter(x => x.score > 0).length || 1;
+
+  // 一次性 SELECT 所有玩家当前状态（IN 查询）
+  const ids = players.map(p => p.playerId);
+  const placeholders = ids.map(() => '?').join(',');
+  const [rows] = await conn.query(
+    `SELECT * FROM players WHERE id IN (${placeholders})`,
+    ids
+  );
+  const playerMap = new Map<string, any>();
+  for (const r of rows as any[]) playerMap.set(r.id, r);
+
+  // 单条 UPDATE 用 CASE/WHEN 批量累加
+  const sets = {
+    total_games: 'CASE id',
+    total_score: 'CASE id',
+    win_rate: 'CASE id',
+    current_streak: 'CASE id',
+    max_win_streak: 'CASE id',
+    max_lose_streak: 'CASE id'
+  } as Record<string, string>;
+  const params: any[] = [];
+  const idsOut: string[] = [];
 
   for (const p of players) {
-    const player = db.prepare('SELECT * FROM players WHERE id = ?').get(p.playerId) as any;
+    const player = playerMap.get(p.playerId);
     if (!player) continue;
 
-    const isWinner = p.score === maxScore && maxScore > 0;
     const totalGames = player.total_games + 1;
     const totalScore = player.total_score + p.score;
 
     // streak：赢家 +1，输家 -1，0 重置
-    let currentStreak = player.current_streak;
-    let maxWinStreak = player.max_win_streak;
-    let maxLoseStreak = player.max_lose_streak;
-
+    let currentStreak: number, maxWinStreak = player.max_win_streak, maxLoseStreak = player.max_lose_streak;
     if (p.score > 0) {
-      currentStreak = currentStreak >= 0 ? currentStreak + 1 : 1;
+      currentStreak = player.current_streak >= 0 ? player.current_streak + 1 : 1;
       if (currentStreak > maxWinStreak) maxWinStreak = currentStreak;
     } else if (p.score < 0) {
-      currentStreak = currentStreak <= 0 ? currentStreak - 1 : -1;
+      currentStreak = player.current_streak <= 0 ? player.current_streak - 1 : -1;
       if (-currentStreak > maxLoseStreak) maxLoseStreak = -currentStreak;
     } else {
       currentStreak = 0;
     }
 
-    const winRate = totalGames > 0 ? Math.round((isWinner ? 1 : 0) * 1000) / 10 : 0;
-    // 简化的胜率：赢家场次 / 总场次（这里单局赢家有多人时按平均算）
-    // v1 简化为：单局里 score>0 算胜
-    const winnerCount = players.filter(x => x.score > 0).length || 1;
     const newWinCount = (player.total_games * player.win_rate / 100) + (1 / winnerCount);
     const finalWinRate = Math.round((newWinCount / totalGames) * 1000) / 10;
 
-    db.prepare(`
-      UPDATE players
-      SET total_games = ?, total_score = ?, win_rate = ?,
-          current_streak = ?, max_win_streak = ?, max_lose_streak = ?
-      WHERE id = ?
-    `).run(totalGames, totalScore, finalWinRate, currentStreak, maxWinStreak, maxLoseStreak, p.playerId);
+    sets.total_games += ` WHEN ? THEN ?`;
+    sets.total_score += ` WHEN ? THEN ?`;
+    sets.win_rate += ` WHEN ? THEN ?`;
+    sets.current_streak += ` WHEN ? THEN ?`;
+    sets.max_win_streak += ` WHEN ? THEN ?`;
+    sets.max_lose_streak += ` WHEN ? THEN ?`;
+    params.push(p.playerId, totalGames, p.playerId, totalScore, p.playerId, finalWinRate,
+                p.playerId, currentStreak, p.playerId, maxWinStreak, p.playerId, maxLoseStreak);
+    idsOut.push(p.playerId);
   }
+
+  if (idsOut.length === 0) return;
+
+  // 关闭每个 CASE + 用 IN 限定行
+  const whereIn = idsOut.map(() => '?').join(',');
+  const sql = `UPDATE players SET
+    total_games = ${sets.total_games} END,
+    total_score = ${sets.total_score} END,
+    win_rate = ${sets.win_rate} END,
+    current_streak = ${sets.current_streak} END,
+    max_win_streak = ${sets.max_win_streak} END,
+    max_lose_streak = ${sets.max_lose_streak} END
+    WHERE id IN (${whereIn})`;
+  await conn.query(sql, [...params, ...idsOut]);
 }
 
 /**
@@ -235,69 +267,72 @@ function updatePlayerStats(recordId: string, players: PlayerScoreInput[]) {
  * 单独拆出来，是为了让批量同步能「插完一批只修剪一次」——
  * 否则一次 500 条的同步会触发 500 次全表扫描 + 删除。
  */
-function insertRecord(userId: string, input: RecordInput): RecordOutput {
+async function insertRecord(userId: string, input: RecordInput): Promise<RecordOutput> {
   validateInput(input);
 
   const recordId = input.id || uuid();
   const now = Date.now();
 
   // 幂等：如果已存在（前端批量同步时），直接返回
-  const existing = db.prepare(
-    'SELECT id FROM records WHERE user_id = ? AND id = ?'
-  ).get(userId, recordId);
+  const existing = await db.queryOne(
+    'SELECT id FROM records WHERE user_id = ? AND id = ?',
+    [userId, recordId]
+  );
   if (existing) {
-    const loaded = loadRecord(userId, recordId);
+    const loaded = await loadRecord(userId, recordId);
     if (loaded) return loaded;
   }
 
-  // 事务：插入战绩 + 关联玩家
-  const tx = db.transaction(() => {
-    db.prepare(`
-      INSERT INTO records (id, user_id, played_at, rule_type, rule_name, duration,
-                           total_fee, note, mood, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      recordId, userId, input.playedAt, input.ruleType, input.ruleName, input.duration,
-      input.totalFee || 0, input.note || '', input.mood ?? null, now, now
+  // 事务：插入战绩 + 关联玩家 + 更新统计
+  await db.withTransaction(async (conn) => {
+    await conn.query(
+      `INSERT INTO records (id, user_id, played_at, rule_type, rule_name, duration,
+                            total_fee, note, mood, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [recordId, userId, input.playedAt, input.ruleType, input.ruleName, input.duration,
+       input.totalFee || 0, input.note || '', input.mood ?? null, now, now]
     );
 
-    // 关联玩家：自动建档
-    const resolved = input.players.map((p, idx) => {
+    // 关联玩家：自动建档（事务内建档也要走 conn）
+    const resolved = [] as PlayerScoreInput[];
+    for (let idx = 0; idx < input.players.length; idx++) {
+      const p = input.players[idx];
       let pid = p.playerId;
       if (!pid) {
-        const player = findOrCreate(userId, p.nickname);
+        const player = await findOrCreateByConn(conn, userId, p.nickname);
         pid = player.id;
       } else {
         // 校验 playerId 归属
-        const own = db.prepare('SELECT id FROM players WHERE id = ? AND user_id = ?')
-          .get(pid, userId);
-        if (!own) throw new BizError('PLAYER_NOT_FOUND', 400, `玩家 ${p.nickname} 不存在`);
+        const [own] = await conn.query(
+          'SELECT id FROM players WHERE id = ? AND user_id = ?',
+          [pid, userId]
+        );
+        if (!(own as any[])[0]) throw new BizError('PLAYER_NOT_FOUND', 400, `玩家 ${p.nickname} 不存在`);
       }
 
-      db.prepare(`
-        INSERT INTO record_players (id, record_id, player_id, nickname, score, is_substitute, is_observer, sort_order)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(uuid(), recordId, pid, p.nickname, p.score, p.isSubstitute ? 1 : 0, p.isObserver ? 1 : 0, idx);
+      await conn.query(
+        `INSERT INTO record_players (id, record_id, player_id, nickname, score, is_substitute, is_observer, sort_order)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [uuid(), recordId, pid, p.nickname, p.score, p.isSubstitute ? 1 : 0, p.isObserver ? 1 : 0, idx]
+      );
 
-      return { ...p, playerId: pid };
-    });
+      resolved.push({ ...p, playerId: pid });
+    }
 
     // 更新玩家统计
-    updatePlayerStats(recordId, resolved);
+    await updatePlayerStats(conn, resolved);
   });
 
-  tx();
-
-  return loadRecord(userId, recordId)!;
+  return (await loadRecord(userId, recordId))!;
 }
 
 /**
  * 创建战绩（单条入口）
  * 写入后按用户等级修剪云端窗口：免费用户只留最近 N 个有数据的日期
  */
-export function createRecord(userId: string, input: RecordInput): RecordOutput {
-  const out = insertRecord(userId, input);
-  trimIfFree(userId);
+export async function createRecord(userId: string, input: RecordInput): Promise<RecordOutput> {
+  const out = await insertRecord(userId, input);
+  await trimIfFree(userId);
   return out;
 }
 
@@ -307,18 +342,18 @@ export function createRecord(userId: string, input: RecordInput): RecordOutput {
  * 全批插入完成后**只修剪一次**，并回传本次淘汰条数，
  * 让前端能明确告诉用户"免费版云端只留了最近 3 天"。
  */
-export function batchCreate(userId: string, records: RecordInput[]): {
+export async function batchCreate(userId: string, records: RecordInput[]): Promise<{
   success: number;
   failed: number;
   results: Array<{ id?: string; ok: boolean; error?: string }>;
   tier: string;
   trimmed: number;
-} {
+}> {
   const results: Array<{ id?: string; ok: boolean; error?: string }> = [];
   let success = 0, failed = 0;
   for (const r of records) {
     try {
-      const out = insertRecord(userId, r);
+      const out = await insertRecord(userId, r);
       results.push({ id: out.id, ok: true });
       success++;
     } catch (e: any) {
@@ -327,8 +362,8 @@ export function batchCreate(userId: string, records: RecordInput[]): {
     }
   }
 
-  const tier = getTier(userId);
-  const trimmed = trimIfFree(userId);
+  const tier = await getTier(userId);
+  const trimmed = await trimIfFree(userId);
 
   return { success, failed, results, tier, trimmed };
 }
@@ -336,25 +371,27 @@ export function batchCreate(userId: string, records: RecordInput[]): {
 /**
  * 战绩列表（分页）
  */
-export function listRecords(userId: string, opts: { limit?: number; offset?: number; ruleType?: string }) {
+export async function listRecords(userId: string, opts: { limit?: number; offset?: number; ruleType?: string }) {
   const limit = Math.min(opts.limit ?? 50, 200);
   const offset = Math.max(opts.offset ?? 0, 0);
   const ruleFilter = opts.ruleType ? 'AND rule_type = ?' : '';
   const params: any[] = ruleFilter ? [userId, opts.ruleType, limit, offset] : [userId, limit, offset];
 
-  const rows = db.prepare(
+  const rows = await db.query<any>(
     `SELECT * FROM records WHERE user_id = ? AND deleted_at IS NULL ${ruleFilter}
-     ORDER BY played_at DESC LIMIT ? OFFSET ?`
-  ).all(...params) as any[];
+     ORDER BY played_at DESC LIMIT ? OFFSET ?`,
+    params
+  );
 
   const ids = rows.map(r => r.id);
   if (ids.length === 0) return { total: 0, items: [] };
 
   const placeholders = ids.map(() => '?').join(',');
-  const players = db.prepare(
+  const players = await db.query<any>(
     `SELECT record_id, player_id, nickname, score, is_substitute, is_observer, sort_order
-     FROM record_players WHERE record_id IN (${placeholders}) ORDER BY sort_order ASC`
-  ).all(...ids) as any[];
+     FROM record_players WHERE record_id IN (${placeholders}) ORDER BY sort_order ASC`,
+    ids
+  );
 
   const grouped: Record<string, any[]> = {};
   for (const p of players) {
@@ -363,15 +400,15 @@ export function listRecords(userId: string, opts: { limit?: number; offset?: num
 
   const items = rows.map(r => ({
     id: r.id,
-    playedAt: r.played_at,
+    playedAt: Number(r.played_at),
     ruleType: r.rule_type,
     ruleName: r.rule_name,
     duration: r.duration,
     totalFee: r.total_fee,
     note: r.note || '',
     mood: r.mood,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
+    createdAt: Number(r.created_at),
+    updatedAt: Number(r.updated_at),
     players: (grouped[r.id] || []).map(p => ({
       playerId: p.player_id,
       nickname: p.nickname,
@@ -381,9 +418,10 @@ export function listRecords(userId: string, opts: { limit?: number; offset?: num
     }))
   }));
 
-  const total = (db.prepare(
-    `SELECT COUNT(*) AS c FROM records WHERE user_id = ? AND deleted_at IS NULL ${ruleFilter}`
-  ).get(...(ruleFilter ? [userId, opts.ruleType] : [userId])) as { c: number }).c;
+  const total = (await db.queryOne<{ c: number }>(
+    `SELECT COUNT(*) AS c FROM records WHERE user_id = ? AND deleted_at IS NULL ${ruleFilter}`,
+    ruleFilter ? [userId, opts.ruleType] : [userId]
+  ))?.c ?? 0;
 
   return { total, items };
 }
@@ -391,16 +429,17 @@ export function listRecords(userId: string, opts: { limit?: number; offset?: num
 /**
  * 单条战绩
  */
-export function getRecord(userId: string, id: string): RecordOutput | null {
+export async function getRecord(userId: string, id: string): Promise<RecordOutput | null> {
   return loadRecord(userId, id);
 }
 
 /**
  * 软删除战绩
  */
-export function deleteRecord(userId: string, id: string): boolean {
-  const r = db.prepare(
-    'UPDATE records SET deleted_at = ?, updated_at = ? WHERE user_id = ? AND id = ? AND deleted_at IS NULL'
-  ).run(Date.now(), Date.now(), userId, id);
-  return r.changes > 0;
+export async function deleteRecord(userId: string, id: string): Promise<boolean> {
+  const r = await db.exec(
+    'UPDATE records SET deleted_at = ?, updated_at = ? WHERE user_id = ? AND id = ? AND deleted_at IS NULL',
+    [Date.now(), Date.now(), userId, id]
+  );
+  return r.affectedRows > 0;
 }

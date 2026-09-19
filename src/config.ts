@@ -32,8 +32,14 @@ export const config = {
     expiresIn: str(process.env.JWT_EXPIRES_IN, '180d')
   },
 
-  db: {
-    path: path.resolve(__dirname, '..', str(process.env.DB_PATH, './data/mahjong.db'))
+  // MySQL（mysql2 连接池；时间戳统一存毫秒 BIGINT，规避 DATE 时区换算）
+  mysql: {
+    host: str(process.env.MYSQL_HOST, '127.0.0.1'),
+    port: num(process.env.MYSQL_PORT, 3306),
+    user: str(process.env.MYSQL_USER, 'mahjong_rw'),
+    password: str(process.env.MYSQL_PASSWORD, ''),
+    database: str(process.env.MYSQL_DATABASE, 'mahjong_records'),
+    connectionLimit: num(process.env.MYSQL_CONNECTION_LIMIT, 10)
   },
 
   wechat: {

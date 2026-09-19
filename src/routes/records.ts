@@ -39,10 +39,10 @@ const ListQuerySchema = z.object({
 /**
  * GET / - 战绩列表
  */
-router.get('/', (req, res, next) => {
+router.get('/', async (req, res, next) => {
   try {
     const opts = ListQuerySchema.parse(req.query);
-    const result = listRecords(req.user!.id, opts);
+    const result = await listRecords(req.user!.id, opts);
     res.json({ code: 0, data: result });
   } catch (e) { next(e); }
 });
@@ -50,10 +50,10 @@ router.get('/', (req, res, next) => {
 /**
  * POST / - 新建战绩
  */
-router.post('/', (req, res, next) => {
+router.post('/', async (req, res, next) => {
   try {
     const body = RecordSchema.parse(req.body);
-    const record = createRecord(req.user!.id, body);
+    const record = await createRecord(req.user!.id, body);
     res.json({ code: 0, data: record });
   } catch (e) { next(e); }
 });
@@ -61,10 +61,10 @@ router.post('/', (req, res, next) => {
 /**
  * POST /batch - 批量同步
  */
-router.post('/batch', (req, res, next) => {
+router.post('/batch', async (req, res, next) => {
   try {
     const body = z.object({ records: z.array(RecordSchema).max(500) }).parse(req.body);
-    const result = batchCreate(req.user!.id, body.records);
+    const result = await batchCreate(req.user!.id, body.records);
     res.json({ code: 0, data: result });
   } catch (e) { next(e); }
 });
@@ -72,9 +72,9 @@ router.post('/batch', (req, res, next) => {
 /**
  * GET /:id
  */
-router.get('/:id', (req, res, next) => {
+router.get('/:id', async (req, res, next) => {
   try {
-    const r = getRecord(req.user!.id, req.params.id);
+    const r = await getRecord(req.user!.id, req.params.id);
     if (!r) return next(new BizError('NOT_FOUND', 404, '战绩不存在'));
     res.json({ code: 0, data: r });
   } catch (e) { next(e); }
@@ -83,9 +83,9 @@ router.get('/:id', (req, res, next) => {
 /**
  * DELETE /:id - 软删除
  */
-router.delete('/:id', (req, res, next) => {
+router.delete('/:id', async (req, res, next) => {
   try {
-    const ok = deleteRecord(req.user!.id, req.params.id);
+    const ok = await deleteRecord(req.user!.id, req.params.id);
     if (!ok) return next(new BizError('NOT_FOUND', 404, '战绩不存在'));
     res.json({ code: 0, data: { ok: true } });
   } catch (e) { next(e); }

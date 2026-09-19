@@ -57,11 +57,11 @@ function hmacSha256Hex(key: string, data: string): string {
  * @throws Error('SESSION_KEY_MISSING') 当库中没有该用户的 session_key 时
  *         —— 前端收到后应重新 wx.login 再试
  */
-export function createPrepay(
+export async function createPrepay(
   userId: string,
   productKey: ProductKey,
   sessionKey: string
-): { signData: string; paySig: string; signature: string; outTradeNo: string; priceFen: number; label: string } {
+): Promise<{ signData: string; paySig: string; signature: string; outTradeNo: string; priceFen: number; label: string }> {
   const product = config.vpay.products[productKey];
   if (!product) throw new Error(`unknown product key: ${productKey}`);
 
@@ -87,40 +87,60 @@ export function createPrepay(
   const paySig = hmacSha256Hex(appKey, `requestVirtualPayment&${signData}`);
   const signature = hmacSha256Hex(sessionKey, signData);
 
-  db.prepare(`
-    INSERT INTO vpay_orders (id, user_id, out_trade_no, product_key, product_id, price_fen, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'created', ?)
-  `).run(uuid(), userId, outTradeNo, productKey, product.productId, product.priceFen, Date.now());
+  await db.exec(
+    `INSERT INTO vpay_orders (id, user_id, out_trade_no, product_key, product_id, price_fen, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'created', ?)`,
+    [uuid(), userId, outTradeNo, productKey, product.productId, product.priceFen, Date.now()]
+  );
 
   return { signData, paySig, signature, outTradeNo, priceFen: product.priceFen, label: product.label };
 }
 
-export function getOrderByOutTradeNo(outTradeNo: string): VpayOrderRow | undefined {
-  return db.prepare('SELECT * FROM vpay_orders WHERE out_trade_no = ?').get(outTradeNo) as
-    | VpayOrderRow
-    | undefined;
+export async function getOrderByOutTradeNo(outTradeNo: string): Promise<VpayOrderRow | undefined> {
+  const row = await db.queryOne<any>('SELECT * FROM vpay_orders WHERE out_trade_no = ?', [outTradeNo]);
+  if (!row) return undefined;
+  return {
+    ...row,
+    price_fen: Number(row.price_fen),
+    created_at: Number(row.created_at),
+    paid_at: row.paid_at === null || row.paid_at === undefined ? null : Number(row.paid_at)
+  };
 }
 
 /**
  * 标记订单已支付并履约（幂等：重复推送 / 重复查询都不会重复发权益）
+ *
+ * 用事务包裹读+改+履约，避免并发推送时的 TOCTOU 竞态：
+ * 比如两个 notify 同时进来，各自 SELECT 都看到 status='created'，然后都 UPDATE 都 SET 都 setTier —— 双发权益。
+ * 事务 + UPDATE WHERE status='created' 让第二次的 UPDATE 影响 0 行，履约函数识别后跳过。
  */
-export function markOrderPaid(outTradeNo: string, source: 'notify' | 'manual'): boolean {
-  const order = getOrderByOutTradeNo(outTradeNo);
-  if (!order) {
-    logger.warn('vpay markOrderPaid: order not found', { outTradeNo, source });
-    return false;
-  }
-  if (order.status === 'paid') return true; // 幂等命中
+export async function markOrderPaid(outTradeNo: string, source: 'notify' | 'manual'): Promise<boolean> {
+  return db.withTransaction(async (conn) => {
+    const [rows] = await conn.query('SELECT * FROM vpay_orders WHERE out_trade_no = ?', [outTradeNo]);
+    const order = (rows as any[])[0];
+    if (!order) {
+      logger.warn('vpay markOrderPaid: order not found', { outTradeNo, source });
+      return false;
+    }
+    if (order.status === 'paid') return true; // 幂等命中
 
-  db.prepare(`UPDATE vpay_orders SET status = 'paid', paid_at = ? WHERE out_trade_no = ? AND status = 'created'`)
-    .run(Date.now(), outTradeNo);
+    const [result] = await conn.query(
+      `UPDATE vpay_orders SET status = 'paid', paid_at = ? WHERE out_trade_no = ? AND status = 'created'`,
+      [Date.now(), outTradeNo]
+    );
+    const affected = (result as any).affectedRows ?? 0;
+    if (affected === 0) {
+      // 并发竞争中我们输给别的请求了，对方已经履约
+      return true;
+    }
 
-  // 履约：升 Pro（唯一的升级入口；兑换码通道已下线）
-  setTier(order.user_id, 'pro');
-  logger.info('vpay order paid, user upgraded to pro', {
-    outTradeNo, userId: order.user_id, productId: order.product_id, source
+    // 履约：升 Pro（唯一的升级入口；兑换码通道已下线）
+    await setTier(order.user_id, 'pro');
+    logger.info('vpay order paid, user upgraded to pro', {
+      outTradeNo, userId: order.user_id, productId: order.product_id, source
+    });
+    return true;
   });
-  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +192,7 @@ export function decryptPush(encryptBase64: string): string {
  *
  * @returns 是否成功处理（调用方据此决定回包）
  */
-export function handlePushBody(body: Record<string, unknown>): { ok: boolean; handled: boolean; event: string } {
+export async function handlePushBody(body: Record<string, unknown>): Promise<{ ok: boolean; handled: boolean; event: string }> {
   let payload: Record<string, unknown> = body;
   const encrypt = (body.Encrypt ?? body.encrypt) as string | undefined;
   if (encrypt) {
@@ -188,7 +208,7 @@ export function handlePushBody(body: Record<string, unknown>): { ok: boolean; ha
       logger.error('vpay deliver notify missing OutTradeNo', { payload });
       return { ok: false, handled: false, event };
     }
-    markOrderPaid(outTradeNo, 'notify');
+    await markOrderPaid(outTradeNo, 'notify');
     return { ok: true, handled: true, event };
   }
 

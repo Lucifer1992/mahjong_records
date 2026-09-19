@@ -2,6 +2,7 @@
  * Express 应用配置
  */
 import express, { Application } from 'express';
+import path from 'path';
 import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
@@ -13,10 +14,9 @@ import { notFound, errorHandler } from './middleware/error';
 
 import authRouter from './routes/auth';
 import recordsRouter from './routes/records';
-import playersRouter from './routes/players';
-import statsRouter from './routes/stats';
 import usersRouter from './routes/users';
 import vpayRouter from './routes/vpay';
+import uploadRouter from './routes/upload';
 
 export function createApp(): Application {
   const app = express();
@@ -60,10 +60,15 @@ export function createApp(): Application {
   // 业务路由
   app.use('/api/auth', authRouter);
   app.use('/api/records', recordsRouter);
-  app.use('/api/players', playersRouter);
-  app.use('/api/stats', statsRouter);
   app.use('/api/users', usersRouter);
   app.use('/api/vpay', vpayRouter);
+  app.use('/api/upload', uploadRouter);
+
+  // 头像等用户素材静态服务（data/avatars → /avatars，经 Nginx 反代同样生效）
+  app.use('/avatars', express.static(path.resolve(__dirname, '..', 'data', 'avatars'), {
+    maxAge: '30d',
+    immutable: true
+  }));
 
   // 404 + 错误处理
   app.use(notFound);

@@ -32,7 +32,7 @@ const PrepaySchema = z.object({
  * 前端流程：调本接口 → 拿 signData/paySig/signature 调 wx.requestVirtualPayment
  * → success 后轮询 GET /order/:outTradeNo 等待履约（发货推送是异步的）。
  */
-router.post('/prepay', authRequired, (req, res, next) => {
+router.post('/prepay', authRequired, async (req, res, next) => {
   try {
     const ready = isReady();
     if (!ready.ok) {
@@ -40,13 +40,13 @@ router.post('/prepay', authRequired, (req, res, next) => {
     }
 
     const { product } = PrepaySchema.parse(req.body);
-    const sessionKey = getSessionKey(req.user!.id);
+    const sessionKey = await getSessionKey(req.user!.id);
     if (!sessionKey) {
       // 让前端知道要重新 wx.login 换新 session_key
       return next(new BizError('SESSION_KEY_MISSING', 409, '登录态过期，请重新登录后支付'));
     }
 
-    const params = createPrepay(req.user!.id, product as ProductKey, sessionKey);
+    const params = await createPrepay(req.user!.id, product as ProductKey, sessionKey);
     res.json({ code: 0, data: params });
   } catch (e) {
     if (e instanceof Error && e.message === 'SESSION_KEY_MISSING') {
@@ -77,7 +77,7 @@ router.get('/notify', (req, res) => {
  * 安全模式下 body = { Encrypt: '...' }（即使数据格式选了 JSON 也会被加密）。
  * 履约成功回包 {"ErrCode":0,"ErrMsg":"OK"}，微信收到非 0 会重试推送 → 服务端必须幂等。
  */
-router.post('/notify', (req, res) => {
+router.post('/notify', async (req, res) => {
   const { msg_signature, timestamp, nonce } = req.query as Record<string, string>;
   const body = (req.body ?? {}) as Record<string, unknown>;
   const encrypt = (body.Encrypt ?? body.encrypt) as string | undefined;
@@ -94,7 +94,7 @@ router.post('/notify', (req, res) => {
       logger.warn('vpay notify received without encryption (明文模式)');
     }
 
-    const result = handlePushBody(body);
+    const result = await handlePushBody(body);
     if (!result.ok) {
       return res.status(200).json({ ErrCode: -1, ErrMsg: 'handle failed' }); // 触发微信重推
     }
@@ -110,9 +110,9 @@ router.post('/notify', (req, res) => {
  * GET /order/:outTradeNo —— 前端支付后轮询（发货推送有延迟）
  * 只能查自己的订单。
  */
-router.get('/order/:outTradeNo', authRequired, (req, res, next) => {
+router.get('/order/:outTradeNo', authRequired, async (req, res, next) => {
   try {
-    const order = getOrderByOutTradeNo(req.params.outTradeNo);
+    const order = await getOrderByOutTradeNo(req.params.outTradeNo);
     if (!order || order.user_id !== req.user!.id) {
       return next(new BizError('NOT_FOUND', 404, '订单不存在'));
     }

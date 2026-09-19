@@ -57,12 +57,10 @@ export const config = {
     perMinute: num(process.env.RATE_LIMIT_PER_MIN, 120)
   },
 
-  // 付费分层（个人主体开不了微信支付，先用兑换码做 MVP 变现通道）
+  // 付费分层（变现走微信虚拟支付 wx.requestVirtualPayment）
   tier: {
     /** 免费用户云端保留「多少个有数据的日期」，默认 3 */
     freeWindowDates: num(process.env.FREE_WINDOW_DATES, 3),
-    /** 兑换码 → 升 Pro。留空则 prod 环境完全关闭兑换入口 */
-    proUnlockCode: str(process.env.PRO_UNLOCK_CODE, ''),
     /** 统计"日期"用的时区偏移（分钟）。480 = UTC+8，麻将用户都在国内 */
     tzOffsetMinutes: num(process.env.TZ_OFFSET_MINUTES, 480)
   },

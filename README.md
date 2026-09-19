@@ -92,7 +92,14 @@ server/
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/users/me` | 当前用户信息 + 等级 + 生效额度 |
-| POST | `/api/users/redeem` | 兑换码升级 Pro（body: `{ "code": "..." }`） |
+
+### 虚拟支付
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/vpay/prepay` | 创建订单 + 双签名（前端拿去调 `wx.requestVirtualPayment`） |
+| GET/POST | `/api/vpay/notify` | MP 后台消息推送：GET 握手验证 / POST 支付结果（幂等履约升 Pro） |
+| GET | `/api/vpay/order/:outTradeNo` | 订单状态查询（前端支付后轮询） |
 
 ### 战绩
 
@@ -135,16 +142,9 @@ server/
 - 日期按 **UTC+8** 切分（`TZ_OFFSET_MINUTES=480`），不是服务器本地时区
 - 升级 Pro 后再同步一次，被淘汰的记录会按 `(user_id, id)` 幂等重新上传
 
-**兑换码**是 MVP 的变现通道（小程序个人主体开不了微信支付）：
-
-```bash
-curl -X POST http://localhost:3456/api/users/redeem \
-  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
-  -d '{"code":"DEV-PRO"}'          # dev 环境万能码
-```
-
-> ⚠️ `PRO_UNLOCK_CODE` 留空时，**prod 环境任何人都无法自助升级**（刻意的安全默认）。
-> 将来接入支付后，把发码换成支付回调里的 `setTier(userId, 'pro')` 即可，分层逻辑不用改。
+**升级 Pro 的唯一入口 = 微信虚拟支付**（`wx.requestVirtualPayment`，道具直购）：
+支付成功后微信通过消息推送回调 `/api/vpay/notify`，服务端幂等履约 `setTier(userId, 'pro')`。
+配置项见 `.env.example` 的 `VPAY_*` 段（OfferId / AppKey / 道具 / 推送 Token / AESKey）。
 
 ### 示例请求
 

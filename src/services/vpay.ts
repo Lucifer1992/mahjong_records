@@ -115,7 +115,7 @@ export function markOrderPaid(outTradeNo: string, source: 'notify' | 'manual'): 
   db.prepare(`UPDATE vpay_orders SET status = 'paid', paid_at = ? WHERE out_trade_no = ? AND status = 'created'`)
     .run(Date.now(), outTradeNo);
 
-  // 履约：升 Pro（与兑换码共用同一入口，分层逻辑零改动）
+  // 履约：升 Pro（唯一的升级入口；兑换码通道已下线）
   setTier(order.user_id, 'pro');
   logger.info('vpay order paid, user upgraded to pro', {
     outTradeNo, userId: order.user_id, productId: order.product_id, source

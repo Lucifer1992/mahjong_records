@@ -238,7 +238,7 @@ MY_TIER=$(echo "$me_body" | grep -oE '"tier"\s*:\s*"[^"]+"' | head -1 | sed 's/.
 info "当前等级 tier = ${MY_TIER:-unknown}"
 
 raw=$(req POST /api/users/redeem '{"code":"__definitely_not_a_real_code__"}' "$TOKEN")
-check "POST /api/users/redeem (无效码→400)" 400 REDEEM_FAILED "$raw" >/dev/null || true
+check "POST /api/users/redeem (已下线→404)" 404 NOT_FOUND "$raw" >/dev/null || true
 
 # 免费窗口修剪：造 4 个不同日期的战绩，云端应只剩最新 3 个日期
 # ⚠️ 破坏性用例：会新增/淘汰记录，因此仅在「自己 wx-login 出来的临时账号」上跑。
@@ -277,23 +277,8 @@ EOF
   check "GET 被淘汰记录 (应 404)" 404 NOT_FOUND "$raw" >/dev/null || true
 fi
 
-# dev 环境下验收「兑换码 → Pro」闭环（跑完这个账号就变 pro 了，故放最后）
-if [[ "$TOKEN_FROM_ENV" -eq 0 && "$ENV_NAME" == "development" && "$MY_TIER" == "free" ]]; then
-  raw=$(req POST /api/users/redeem '{"code":"DEV-PRO"}' "$TOKEN")
-  check "POST /api/users/redeem (dev 万能码)" 200 0 "$raw" >/dev/null || true
-
-  raw=$(req GET /api/users/me "" "$TOKEN")
-  pro_body=$(check "GET /api/users/me (升级后)" 200 0 "$raw" || true)
-  NOW_TIER=$(echo "$pro_body" | grep -oE '"tier"\s*:\s*"[^"]+"' | head -1 | sed 's/.*"tier"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-  if [[ "$NOW_TIER" == "pro" ]]; then
-    ok "兑换码升级 → tier=pro"
-  else
-    err "兑换码升级 → 期望 tier=pro，实际 ${NOW_TIER:-N/A}"
-    FAIL=$((FAIL+1))
-  fi
-else
-  skip "兑换码升级（非 dev 环境 或 使用了外部 TOKEN）"
-fi
+# 兑换码通道已下线（2026-09-19）：升级唯一入口 = 虚拟支付回调履约，
+# 沙箱环境的支付履约由 scripts/vpay 单测覆盖（见 dist 冒烟测试），这里不再造 pro 账号。
 
 # ---------- 5. 清理 ----------
 echo

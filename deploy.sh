@@ -26,6 +26,102 @@ warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 err()  { echo -e "${RED}[ERR ]${NC} $1"; }
 step() { echo -e "\n${BLUE}▶ $1${NC}"; }
 
+# ---------------------------------------------------------------
+# align_env_with_example — 把 .env 缺的 key 从 .env.example 补齐
+#
+# 规则（重要：绝对不覆盖 .env 里已有 key 的 value）：
+#   - .env 已存在 key（即便值是空 / 默认值 / 被注释）：一律保留
+#   - .env 没有但 .env.example 有的 key：从 example 抽取「带前后注释」
+#     追加到 .env 末尾（追加前自动留分隔注释 + 时间戳）
+#   - .env 独有但 .env.example 没有的 key：不删（视为用户自定义）
+#
+# 解析要点：
+#   - KEY = 行首去除行内注释（# 开头整行跳过）后第一个 = 之前的部分
+#   - .env 已有的 key 集合 = 「有效赋值行的 key 集合」
+#     （含 KEY= 这种空值行；含 # 被注释掉的整段—— 因为用户显式注释，
+#      视为不需要此 key 的最新配置）
+#   - 取 example 里所有「有效赋值行的 key 集合」减去上面集合 = 待补 key
+#
+# 幂等：连跑两次结果一致（第一次补完后 .env 已包含所有 key，第二次无操作）
+# ---------------------------------------------------------------
+align_env_with_example() {
+  # 防御：如果 example 不存在就直接返回（异常场景不应阻塞部署）
+  [ -f ".env.example" ] || { warn ".env.example 不存在,跳过对齐"; return 0; }
+
+  # 收集 .env 中「已声明的 key」集合：
+  #   - 有效赋值行（KEY=xxx，含 KEY= 空值）
+  #   - 被注释的赋值行（# KEY=xxx / # KEY=xxx）
+  # 用户的注释视为「显式保留此 key 在 .env 中的痕迹」，align 不应重写它的状态
+  local env_keys
+  env_keys=$(
+    {
+      grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env || true
+      grep -E '^#[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' .env || true
+    } | sed -E 's/^#[[:space:]]*//' | cut -d= -f1 | sort -u
+  )
+
+  # 收集 example 中所有「有效赋值行」的 key
+  local example_keys
+  example_keys=$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env.example | cut -d= -f1 | sort -u)
+
+  # 缺失的 key（example 有但 .env 没有）
+  local missing
+  missing=$(comm -23 <(printf '%s\n' "$example_keys") <(printf '%s\n' "$env_keys"))
+  if [ -z "$missing" ]; then
+    info ".env 已是最新(包含全部 example 键)"
+    return 0
+  fi
+
+  local count
+  count=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
+  info ".env 缺少 $count 个键,将从 .env.example 追加..."
+
+  # 抽取 example 中「缺失 key 所在行 + 紧邻上方的注释块」，追加到 .env 末尾
+  # 策略：对每个缺失 key，向前找最近一段连续注释行（# 开头），整段复制
+  local stamp
+  stamp=$(date '+%Y-%m-%d %H:%M:%S')
+  local added=0
+  {
+    # 保留 .env 原有内容 + 一个空行
+    [ -s .env ] && cat .env
+    echo ""
+    echo "# ============================================================"
+    echo "# 以下键由 deploy.sh 自动追加（与 .env.example 对齐），$stamp"
+    echo "# 这些值是 .env.example 的默认值，请按需修改后 reload 服务"
+    echo "# ============================================================"
+    echo ""
+
+    # 按 example 中出现的顺序逐个抽取缺失 key 段（注释块 + 赋值行）
+    local in_block="" block=""
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "$line" ]]; then
+        # 注释行 / 空行：暂存为 block 的一部分
+        block="${block}${line}"$'\n'
+        continue
+      fi
+      # 赋值行：取 key
+      local key="${line%%=*}"
+      if printf '%s\n' "$missing" | grep -qxF "$key"; then
+        printf '%s' "$block"
+        echo "$line"
+        echo ""
+        added=$((added + 1))
+      fi
+      block=""
+    done < .env.example
+  } > .env.tmp
+
+  # 防御：如果 awk 出错或 added=0 不写（避免清空 .env）
+  if [ "$added" -eq 0 ]; then
+    rm -f .env.tmp
+    warn ".env 对齐失败 (added=0), 保持原 .env 不变"
+    return 1
+  fi
+
+  mv .env.tmp .env
+  info ".env 已对齐,新增 $added 个键"
+}
+
 # ----- 参数解析 -----
 MODE="update"   # update | init | reset
 for arg in "$@"; do
@@ -133,6 +229,13 @@ else
     err "❌ JWT_SECRET 还是默认值!请编辑 .env 后重新执行"
     exit 1
   fi
+
+  # 对齐 .env 与 .env.example 的键值集合
+  # 规则：
+  #   - .env 已存在 key（不论值是空/默认/真实）：一律不动
+  #   - .env 缺失但 .env.example 有的 key：从 example 抽出「带前后注释」追加到 .env 末尾
+  #   - .env 独有但 .env.example 没有的 key：不删（用户自定义配置）
+  align_env_with_example
 fi
 
 # 检查 .env 里的 nginx / certbot 相关配置

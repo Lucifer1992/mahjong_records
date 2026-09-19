@@ -32,6 +32,13 @@ export interface RecordInput {
   players: PlayerScoreInput[];
 }
 
+/**
+ * 已解析过 playerId 的玩家（findOrCreateByConn 建档 / 归属校验后）
+ * updatePlayerStats 只处理已存在的玩家，所以入参必须 narrow 到这个类型，
+ * 避免在函数体内反复处理 playerId 可能为 undefined 的分支
+ */
+type ResolvedPlayer = PlayerScoreInput & { playerId: string };
+
 export interface RecordOutput {
   id: string;
   playedAt: number;
@@ -185,7 +192,7 @@ async function loadRecord(userId: string, recordId: string): Promise<RecordOutpu
  * 性能：之前每个玩家一次 SELECT + 一次 UPDATE，单局 4-8 人 = 8-16 次往返；
  * 现在每个玩家只一次 SELECT，UPDATE 合并为单条 CASE/WHEN。
  */
-async function updatePlayerStats(conn: PoolConnection, players: PlayerScoreInput[]) {
+async function updatePlayerStats(conn: PoolConnection, players: ResolvedPlayer[]) {
   if (players.length === 0) return;
 
   // 每局内 score>0 算胜，多人赢时按均摊累加（保持原有语义）
@@ -294,7 +301,7 @@ async function insertRecord(userId: string, input: RecordInput): Promise<RecordO
     );
 
     // 关联玩家：自动建档（事务内建档也要走 conn）
-    const resolved = [] as PlayerScoreInput[];
+    const resolved: ResolvedPlayer[] = [];
     for (let idx = 0; idx < input.players.length; idx++) {
       const p = input.players[idx];
       let pid = p.playerId;
@@ -316,7 +323,7 @@ async function insertRecord(userId: string, input: RecordInput): Promise<RecordO
         [uuid(), recordId, pid, p.nickname, p.score, p.isSubstitute ? 1 : 0, p.isObserver ? 1 : 0, idx]
       );
 
-      resolved.push({ ...p, playerId: pid });
+      resolved.push({ ...p, playerId: pid } as ResolvedPlayer);
     }
 
     // 更新玩家统计

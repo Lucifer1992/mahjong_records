@@ -124,19 +124,36 @@ align_env_with_example() {
 
 # ----- 参数解析 -----
 MODE="update"   # update | init | reset
+ALIGN_ONLY=false
 for arg in "$@"; do
   case $arg in
     --init)  MODE="init" ;;
     --reset) MODE="reset" ;;
+    --align-env)
+      # 单独跑对齐：用于 deploy 失败后想单独补齐 .env 键值
+      ALIGN_ONLY=true ;;
     -h|--help)
-      echo "用法: bash deploy.sh [--init | --reset]"
-      echo "  --init   首次部署（强制重建数据）"
-      echo "  --reset  清理后全新部署（保留 .env）"
-      echo "  默认     增量更新（拉代码 / 装依赖 / reload）"
+      echo "用法: bash deploy.sh [--init | --reset | --align-env]"
+      echo "  --init        首次部署（强制重建数据）"
+      echo "  --reset       清理后全新部署（保留 .env）"
+      echo "  --align-env   仅对齐 .env 与 .env.example 的键集合（不动其他）"
+      echo "  默认          增量更新（拉代码 / 装依赖 / reload）"
       exit 0 ;;
     *) err "未知参数: $arg"; exit 1 ;;
   esac
 done
+
+# ----- 单独跑对齐的快捷模式：尽早执行，不依赖 Node/PM2/git -----
+if [ "$ALIGN_ONLY" = true ]; then
+  step "对齐 .env"
+  # 防御：必须在 server 目录下
+  if [ ! -f ".env.example" ]; then
+    err ".env.example 不存在,请在 server 目录下执行"
+    exit 1
+  fi
+  align_env_with_example
+  exit 0
+fi
 
 # ----- 0. 环境检查 -----
 step "0/10 环境检查"

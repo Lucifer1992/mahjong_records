@@ -87,14 +87,12 @@ export const config = {
     products: {
       lifetime: {
         productId: str(process.env.VPAY_PRODUCT_LIFETIME, 'PRO_LIFETIME'),
-        priceFen: num(process.env.VPAY_PRICE_LIFETIME, 6800), // ¥68，单位：分
-        label: 'Pro 终身'
-      },
-      yearly: {
-        productId: str(process.env.VPAY_PRODUCT_YEARLY, 'PRO_YEARLY'),
-        priceFen: num(process.env.VPAY_PRICE_YEARLY, 2800), // ¥28，单位：分
-        label: 'Pro 年卡'
+        priceFen: num(process.env.VPAY_PRICE_LIFETIME, 990), // ¥9.9 终身，单位：分
+        label: 'Pro 终身 · ¥9.9'
       }
+      // 年度档（yearly）已下架：雀战录只提供一档终身 9.9 元。
+      // 配置字段保留在 .env.example（默认 2800）便于运维回滚，
+      // 前端 / API 均不再调用。
     },
     /** MP 后台「消息推送」配置的 Token（GET 握手 + 推送签名校验），与后台保持一致 */
     pushToken: str(process.env.VPAY_PUSH_TOKEN, ''),

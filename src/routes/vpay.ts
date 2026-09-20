@@ -23,7 +23,7 @@ import { BizError } from '../middleware/error';
 const router = Router();
 
 const PrepaySchema = z.object({
-  product: z.enum(['lifetime', 'yearly'])
+  product: z.enum(['lifetime'])   // 雀战录只提供 Pro 终身一档
 });
 
 /**

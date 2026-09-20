@@ -75,6 +75,8 @@ align_env_with_example() {
   local count
   count=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
   info ".env 缺少 $count 个键,将从 .env.example 追加..."
+  # 常驻打印：铁匠要求对齐失败要看到具体哪些 key 没补上
+  info "[DEBUG] 待补 keys: $(printf '%s' "$missing" | tr '\n' ',' | sed 's/,$//')"
 
   # 抽取 example 中「缺失 key 所在行 + 紧邻上方的注释块」，追加到 .env 末尾
   # 策略：对每个缺失 key，向前找最近一段连续注释行（# 开头），整段复制
@@ -92,7 +94,7 @@ align_env_with_example() {
     echo ""
 
     # 按 example 中出现的顺序逐个抽取缺失 key 段（注释块 + 赋值行）
-    local in_block="" block=""
+    local block=""
     while IFS= read -r line; do
       if [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "$line" ]]; then
         # 注释行 / 空行：暂存为 block 的一部分
@@ -111,10 +113,21 @@ align_env_with_example() {
     done < .env.example
   } > .env.tmp
 
-  # 防御：如果 awk 出错或 added=0 不写（避免清空 .env）
+  # 铁匠要求：没对齐就报错退出，告诉我哪里没对齐
   if [ "$added" -eq 0 ]; then
     rm -f .env.tmp
-    warn ".env 对齐失败 (added=0), 保持原 .env 不变"
+    err ".env 对齐失败：检测到 $count 个待补 key，但 .env.example 遍历后没有任何一行匹配"
+    err "可能原因：example 被注释化 / BOM 污染 / 行尾含特殊字符 / key 名前有空格"
+    err "建议：手动从 .env.example 把以下 key 复制到 .env 末尾："
+    printf '%s\n' "$missing" | while read -r k; do
+      [ -n "$k" ] && err "  - $k"
+    done
+    return 1
+  fi
+
+  # 部分对齐成功但 missing 还有未匹配的（理论上不应该，但兜底）
+  if [ "$added" -lt "$count" ]; then
+    err ".env 部分对齐：期望 $count 个，实际补 $added 个"
     return 1
   fi
 

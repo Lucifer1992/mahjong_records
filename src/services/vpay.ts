@@ -16,7 +16,7 @@ import { config } from '../config';
 import { logger } from '../logger';
 import { setTier } from './users';
 
-export type ProductKey = 'lifetime' | 'yearly';
+export type ProductKey = 'lifetime';
 
 export interface VpayOrderRow {
   id: string;

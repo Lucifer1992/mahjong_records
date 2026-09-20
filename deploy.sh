@@ -94,8 +94,14 @@ align_env_with_example() {
     echo ""
 
     # 按 example 中出现的顺序逐个抽取缺失 key 段（注释块 + 赋值行）
+    #
+    # ⚠️ 关键陷阱：while IFS= read -r line 读最后一行时，bash 会丢掉「文件末尾没有
+    # 换行符」的最后一整行内容。这是 bash 经典 bug（POSIX 行为），遇到没换行结尾
+    # 的文件（如某些编辑器保存），最后一行 KEY 完全不会进入循环。
+    # 防御：在重定向 < .env.example 末尾补一个 \n —— 但 < 重定向无法修饰已存在的文件，
+    # 用进程替换 < <(cat .env.example; echo) 把末尾补一个换行。
     local block=""
-    while IFS= read -r line; do
+    while IFS= read -r line || [ -n "$line" ]; do
       if [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "$line" ]]; then
         # 注释行 / 空行：暂存为 block 的一部分
         block="${block}${line}"$'\n'
@@ -110,7 +116,7 @@ align_env_with_example() {
         added=$((added + 1))
       fi
       block=""
-    done < .env.example
+    done < <(cat .env.example; echo)
   } > .env.tmp
 
   # 铁匠要求：没对齐就报错退出，告诉我哪里没对齐

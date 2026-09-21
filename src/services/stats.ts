@@ -1,5 +1,5 @@
 /**
- * 统计业务（总览 / 福星克星 / 牌运月历）—— MySQL 异步版
+ * 统计业务（总览 / 福星克星 / 牌局月历）—— MySQL 异步版
  *
  * 注意：前端实际不调用这些接口（分析全在本地算），保留是为了
  * 后台 / 未来版本可用；语义与旧 SQLite 版保持一致。
@@ -198,7 +198,7 @@ export async function getFortune(userId: string, playerId: string, topN = 5): Pr
 }
 
 /**
- * 牌运月历：返回某月每天的净分与场次
+ * 牌局月历：返回某月每天的净分与场次
  */
 export async function getCalendar(userId: string, year: number, month: number, playerNickname?: string): Promise<CalendarDay[]> {
   const start = new Date(year, month - 1, 1).getTime();

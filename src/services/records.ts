@@ -269,10 +269,79 @@ async function updatePlayerStats(conn: PoolConnection, players: ResolvedPlayer[]
 }
 
 /**
+ * 用输入内容拼一个 RecordOutput（幂等命中墓碑记录时用，云端正本已被删除，只能按输入还原）
+ */
+function outputFromInput(input: RecordInput, recordId: string, createdAt: number, updatedAt: number): RecordOutput {
+  return {
+    id: recordId,
+    playedAt: input.playedAt,
+    ruleType: input.ruleType,
+    ruleName: input.ruleName,
+    duration: input.duration,
+    totalFee: input.totalFee || 0,
+    note: input.note || '',
+    mood: input.mood ?? null,
+    createdAt,
+    updatedAt,
+    players: input.players.map(p => ({
+      playerId: p.playerId || '',
+      nickname: p.nickname,
+      score: p.score,
+      isSubstitute: !!p.isSubstitute,
+      isObserver: !!p.isObserver
+    }))
+  };
+}
+
+/**
+ * 在已有连接上读取一条未删除战绩（事务内使用，避免再向连接池要连接）
+ */
+async function loadRecordByConn(conn: PoolConnection, userId: string, recordId: string): Promise<RecordOutput | null> {
+  const [rows] = await conn.query<any[]>(
+    'SELECT * FROM records WHERE user_id = ? AND id = ? AND deleted_at IS NULL',
+    [userId, recordId]
+  );
+  const r = (rows as any[])[0];
+  if (!r) return null;
+
+  const [pRows] = await conn.query<any[]>(
+    'SELECT player_id, nickname, score, is_substitute, is_observer FROM record_players WHERE record_id = ? ORDER BY sort_order ASC',
+    [recordId]
+  );
+
+  return {
+    id: r.id,
+    playedAt: Number(r.played_at),
+    ruleType: r.rule_type,
+    ruleName: r.rule_name,
+    duration: r.duration,
+    totalFee: r.total_fee,
+    note: r.note || '',
+    mood: r.mood,
+    createdAt: Number(r.created_at),
+    updatedAt: Number(r.updated_at),
+    players: (pRows as any[]).map(p => ({
+      playerId: p.player_id,
+      nickname: p.nickname,
+      score: p.score,
+      isSubstitute: !!p.is_substitute,
+      isObserver: !!p.is_observer
+    }))
+  };
+}
+
+/**
  * 写入单条战绩（**不做**免费窗口修剪）
  *
  * 单独拆出来，是为了让批量同步能「插完一批只修剪一次」——
  * 否则一次 500 条的同步会触发 500 次全表扫描 + 删除。
+ *
+ * 幂等：同一条记录重复推送只会走下面四种分支之一，**不会产生重复数据**
+ * 1. 不存在           → 正常插入
+ * 2. 已存在且未删除   → 直接返回云端副本（不再插一次，也不重复累加玩家统计）
+ * 3. 已存在但已软删除 → **不复活**，按「已处理」返回。早期版本会落到 INSERT 撞主键
+ *                       报 ER_DUP_ENTRY，被记成 failed 后又回到前端重试队列，永久失败
+ * 4. 并发重复推送     → 靠事务内的 SELECT ... FOR UPDATE 串行化，第二个会命中分支 2
  */
 async function insertRecord(userId: string, input: RecordInput): Promise<RecordOutput> {
   validateInput(input);
@@ -280,18 +349,27 @@ async function insertRecord(userId: string, input: RecordInput): Promise<RecordO
   const recordId = input.id || uuid();
   const now = Date.now();
 
-  // 幂等：如果已存在（前端批量同步时），直接返回
-  const existing = await db.queryOne(
-    'SELECT id FROM records WHERE user_id = ? AND id = ?',
-    [userId, recordId]
-  );
-  if (existing) {
-    const loaded = await loadRecord(userId, recordId);
-    if (loaded) return loaded;
-  }
+  return await db.withTransaction(async (conn) => {
+    // ⚠️ 行锁必须在事务内：早期版本 SELECT 在事务外，两个同步请求同时到达时
+    //    会「都查到不存在」然后一起去 INSERT，后一个必撞主键冲突。
+    const [existRows] = await conn.query<any[]>(
+      'SELECT id, created_at, updated_at, deleted_at FROM records WHERE user_id = ? AND id = ? FOR UPDATE',
+      [userId, recordId]
+    );
+    const exist = (existRows as any[])[0];
 
-  // 事务：插入战绩 + 关联玩家 + 更新统计
-  await db.withTransaction(async (conn) => {
+    if (exist) {
+      if (exist.deleted_at) {
+        // 墓碑：不复活
+        return outputFromInput(input, recordId, Number(exist.created_at) || now, now);
+      }
+      const loaded = await loadRecordByConn(conn, userId, recordId);
+      if (loaded) return loaded;
+      // 理论上到不了这里（上面已确认未删除），兜底保持幂等
+      return outputFromInput(input, recordId, Number(exist.created_at) || now, Number(exist.updated_at) || now);
+    }
+
+    // 1. 插入战绩主行
     await conn.query(
       `INSERT INTO records (id, user_id, played_at, rule_type, rule_name, duration,
                             total_fee, note, mood, created_at, updated_at)
@@ -300,7 +378,7 @@ async function insertRecord(userId: string, input: RecordInput): Promise<RecordO
        input.totalFee || 0, input.note || '', input.mood ?? null, now, now]
     );
 
-    // 关联玩家：自动建档（事务内建档也要走 conn）
+    // 2. 关联玩家：自动建档（事务内建档也要走 conn）
     const resolved: ResolvedPlayer[] = [];
     for (let idx = 0; idx < input.players.length; idx++) {
       const p = input.players[idx];
@@ -326,11 +404,13 @@ async function insertRecord(userId: string, input: RecordInput): Promise<RecordO
       resolved.push({ ...p, playerId: pid } as ResolvedPlayer);
     }
 
-    // 更新玩家统计
+    // 3. 更新玩家统计
     await updatePlayerStats(conn, resolved);
-  });
 
-  return (await loadRecord(userId, recordId))!;
+    // 4. 返回刚插进去的正本（同一连接读，避免向连接池再要连接）
+    const created = await loadRecordByConn(conn, userId, recordId);
+    return created || outputFromInput(input, recordId, now, now);
+  });
 }
 
 /**

@@ -7,7 +7,7 @@ Node.js + Express + TypeScript + SQLite + PM2，自带部署脚本。
 - 🚀 **零运维**：SQLite 单文件，开箱即用
 - 🔐 **JWT 鉴权**：微信登录 → 自动签发 token
 - 🛡️ **基础防护**：Helmet + CORS + 内存限流
-- 📊 **完整业务**：战绩 / 玩家 / 统计 / 福星克星 / 牌运月历
+- 📊 **完整业务**：战绩 / 玩家 / 统计 / 福星克星 / 牌局月历
 - 🔁 **软删除**：删战绩不影响玩家统计稳定性
 - 🔄 **批量同步**：首登 / 离线恢复友好
 - 📦 **PM2 部署**：graceful reload，零停机热更新
@@ -126,7 +126,7 @@ server/
 |---|---|---|
 | GET | `/api/stats/summary?nickname=xxx` | 总览 |
 | GET | `/api/stats/fortune?playerId=xxx&topN=5` | 福星克星 |
-| GET | `/api/stats/calendar?year=2026&month=9&nickname=xxx` | 牌运月历 |
+| GET | `/api/stats/calendar?year=2026&month=9&nickname=xxx` | 牌局月历 |
 
 ### 免费 / 付费分层
 

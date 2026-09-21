@@ -391,6 +391,15 @@ else
 server {
     listen 80;
     server_name ${ENV_DOMAIN};
+    return 301 https://\$server_name\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name ${ENV_DOMAIN};
+
+    ssl_certificate /etc/letsencrypt/live/${ENV_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${ENV_DOMAIN}/privkey.pem;
 
     # 安全: 禁止直接访问敏感路径
     location ~ /\.(env|git) { deny all; return 404; }

@@ -17,6 +17,7 @@ import recordsRouter from './routes/records';
 import usersRouter from './routes/users';
 import vpayRouter from './routes/vpay';
 import uploadRouter from './routes/upload';
+import feedbackRouter from './routes/feedback';
 
 export function createApp(): Application {
   const app = express();
@@ -61,8 +62,9 @@ export function createApp(): Application {
   app.use('/api/auth', authRouter);
   app.use('/api/records', recordsRouter);
   app.use('/api/users', usersRouter);
-  app.use('/api/vpay', vpayRouter);
-  app.use('/api/upload', uploadRouter);
+app.use('/api/vpay', vpayRouter);
+app.use('/api/upload', uploadRouter);
+app.use('/api/feedback', feedbackRouter);
 
   // 头像等用户素材静态服务（data/avatars → /avatars，经 Nginx 反代同样生效）
   app.use('/avatars', express.static(path.resolve(__dirname, '..', 'data', 'avatars'), {

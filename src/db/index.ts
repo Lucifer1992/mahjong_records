@@ -156,6 +156,17 @@ const DDL = `
     KEY idx_vpay_orders_user (user_id),
     CONSTRAINT fk_vpay_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+  -- 意见反馈：只存 user_id + 内容 + 时间戳；不收集手机号/姓名/IP 等敏感信息
+  -- 防刷：service 层每用户每天最多 5 条；DB 这里只做索引，外键级联删 user 即可清空
+  CREATE TABLE IF NOT EXISTS feedback (
+    id          VARCHAR(36) PRIMARY KEY,
+    user_id     VARCHAR(36) NOT NULL,
+    content     VARCHAR(500) NOT NULL,
+    created_at  BIGINT       NOT NULL,
+    KEY idx_feedback_user_time (user_id, created_at),
+    CONSTRAINT fk_feedback_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 `;
 
 export async function initSchema(): Promise<void> {

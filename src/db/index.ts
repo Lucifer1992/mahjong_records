@@ -143,16 +143,20 @@ const DDL = `
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
   CREATE TABLE IF NOT EXISTS vpay_orders (
-    id           VARCHAR(36) PRIMARY KEY,
-    user_id      VARCHAR(36) NOT NULL,
-    out_trade_no VARCHAR(40) NOT NULL,
-    product_key  VARCHAR(32) NOT NULL,
-    product_id   VARCHAR(64) NOT NULL,
-    price_fen    INT         NOT NULL,
-    status       VARCHAR(16) NOT NULL DEFAULT 'created',
-    created_at   BIGINT      NOT NULL,
-    paid_at      BIGINT      NULL,
+    id            VARCHAR(36)  PRIMARY KEY,
+    user_id       VARCHAR(36)  NOT NULL,
+    out_trade_no  VARCHAR(40)  NOT NULL,
+    -- 平台单号（推送里的 WeChatPayInfo.MchOrderNo / wx_order_id）：官方要求的幂等键
+    -- 第一次推送收到后写入；同号重复推送直接幂等命中
+    wx_order_id   VARCHAR(64)  NULL,
+    product_key   VARCHAR(32)  NOT NULL,
+    product_id    VARCHAR(64)  NOT NULL,
+    price_fen     INT          NOT NULL,
+    status        VARCHAR(16)  NOT NULL DEFAULT 'created',
+    created_at    BIGINT       NOT NULL,
+    paid_at       BIGINT       NULL,
     UNIQUE KEY uk_vpay_out_trade_no (out_trade_no),
+    UNIQUE KEY uk_vpay_wx_order_id (wx_order_id),
     KEY idx_vpay_orders_user (user_id),
     CONSTRAINT fk_vpay_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

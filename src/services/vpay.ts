@@ -22,6 +22,7 @@ export interface VpayOrderRow {
   id: string;
   user_id: string;
   out_trade_no: string;
+  wx_order_id: string | null;        // 平台单号，幂等键
   product_key: string;
   product_id: string;
   price_fen: number;
@@ -76,7 +77,8 @@ export async function createPrepay(
   const signData = JSON.stringify({
     offerId: config.vpay.offerId,
     buyQuantity: 1,
-    env: config.vpay.env,          // 0=现网 1=沙箱
+    // 官方文档明确：env 固定填 0（正式环境/现网）；沙箱/现网通过 AppKey 区分，不改 env
+    env: 0,
     currencyType: 'CNY',
     productId: product.productId,
     goodsPrice: product.priceFen,  // ⚠️ 单位是分！1 元 = 100
@@ -110,12 +112,21 @@ export async function getOrderByOutTradeNo(outTradeNo: string): Promise<VpayOrde
 /**
  * 标记订单已支付并履约（幂等：重复推送 / 重复查询都不会重复发权益）
  *
+ * 幂等键：
+ *   1. 首选 wx_order_id（官方要求：平台单号 MchOrderNo 才是跟踪/对账/幂等依据）
+ *   2. 兜底 outTradeNo（数据库唯一约束保证）
+ *
  * 用事务包裹读+改+履约，避免并发推送时的 TOCTOU 竞态：
  * 比如两个 notify 同时进来，各自 SELECT 都看到 status='created'，然后都 UPDATE 都 SET 都 setTier —— 双发权益。
  * 事务 + UPDATE WHERE status='created' 让第二次的 UPDATE 影响 0 行，履约函数识别后跳过。
  */
-export async function markOrderPaid(outTradeNo: string, source: 'notify' | 'manual'): Promise<boolean> {
+export async function markOrderPaid(
+  outTradeNo: string,
+  wxOrderId: string | null,
+  source: 'notify' | 'manual'
+): Promise<boolean> {
   return db.withTransaction(async (conn) => {
+    // 1. 拿到订单
     const [rows] = await conn.query('SELECT * FROM vpay_orders WHERE out_trade_no = ?', [outTradeNo]);
     const order = (rows as any[])[0];
     if (!order) {
@@ -124,6 +135,25 @@ export async function markOrderPaid(outTradeNo: string, source: 'notify' | 'manu
     }
     if (order.status === 'paid') return true; // 幂等命中
 
+    // 2. 写入 wx_order_id（幂等键 + 对账用）
+    //    首次收到推送时写入；同号重复推送时 DB UNIQUE 约束会让 INSERT 失败，我们靠这个兜底
+    if (wxOrderId && order.wx_order_id !== wxOrderId) {
+      try {
+        await conn.query(
+          `UPDATE vpay_orders SET wx_order_id = ? WHERE out_trade_no = ? AND wx_order_id IS NULL`,
+          [wxOrderId, outTradeNo]
+        );
+      } catch (e: any) {
+        // UNIQUE 冲突 = 已有相同 wx_order_id 的订单 = 重复推送，跳过
+        if (e?.code === 'ER_DUP_ENTRY' || e?.errno === 1062) {
+          logger.warn('vpay wx_order_id duplicate (repeat notify)', { wxOrderId, outTradeNo });
+          return true;
+        }
+        throw e;
+      }
+    }
+
+    // 3. 标记 paid
     const [result] = await conn.query(
       `UPDATE vpay_orders SET status = 'paid', paid_at = ? WHERE out_trade_no = ? AND status = 'created'`,
       [Date.now(), outTradeNo]
@@ -134,10 +164,10 @@ export async function markOrderPaid(outTradeNo: string, source: 'notify' | 'manu
       return true;
     }
 
-    // 履约：升 Pro（唯一的升级入口；兑换码通道已下线）
+    // 4. 履约：升 Pro（唯一的升级入口；兑换码通道已下线）
     await setTier(order.user_id, 'pro');
     logger.info('vpay order paid, user upgraded to pro', {
-      outTradeNo, userId: order.user_id, productId: order.product_id, source
+      outTradeNo, wxOrderId, userId: order.user_id, productId: order.product_id, source
     });
     return true;
   });
@@ -203,12 +233,15 @@ export async function handlePushBody(body: Record<string, unknown>): Promise<{ o
   if (event === 'xpay_goods_deliver_notify') {
     // 字段兼容：不同文档版本里可能是 OutTradeNo / out_trade_no，外层或 data 里
     const data = (payload.Data ?? payload.data ?? payload) as Record<string, unknown>;
-    const outTradeNo = String(data.OutTradeNo ?? data.out_trade_no ?? data.OutTradeNo ?? '');
+    const outTradeNo = String(data.OutTradeNo ?? data.out_trade_no ?? '');
     if (!outTradeNo) {
       logger.error('vpay deliver notify missing OutTradeNo', { payload });
       return { ok: false, handled: false, event };
     }
-    await markOrderPaid(outTradeNo, 'notify');
+    // 官方幂等键：WeChatPayInfo.MchOrderNo = wx_order_id（平台单号）
+    const wxPayInfo = (data.WeChatPayInfo ?? data.wechatpay_info ?? {}) as Record<string, unknown>;
+    const wxOrderId = String(wxPayInfo.MchOrderNo ?? wxPayInfo.mch_order_no ?? '') || null;
+    await markOrderPaid(outTradeNo, wxOrderId, 'notify');
     return { ok: true, handled: true, event };
   }
 

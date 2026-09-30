@@ -77,8 +77,10 @@ export async function createPrepay(
   const signData = JSON.stringify({
     offerId: config.vpay.offerId,
     buyQuantity: 1,
-    // 官方文档明确：env 固定填 0（正式环境/现网）；沙箱/现网通过 AppKey 区分，不改 env
-    env: 0,
+    // 官方文档明确：env 必须与 AppKey 匹配（0=现网 AppKey / 1=沙箱 AppKey）
+    // —— 用沙箱 AppKey 签 paySig 时，signData 的 env 必须填 1，微信侧才会用沙箱 key 验签
+    // 错误码 -15011「现网版本的 env 只能是 0」是反向关系：env=0 必须配现网 key
+    env: config.vpay.env,
     currencyType: 'CNY',
     productId: product.productId,
     goodsPrice: product.priceFen,  // ⚠️ 单位是分！1 元 = 100
@@ -107,6 +109,76 @@ export async function getOrderByOutTradeNo(outTradeNo: string): Promise<VpayOrde
     created_at: Number(row.created_at),
     paid_at: row.paid_at === null || row.paid_at === undefined ? null : Number(row.paid_at)
   };
+}
+
+/**
+ * 主动向微信查询订单状态（兜底发货推送）
+ *
+ * 背景：xpay_goods_deliver_notify 推送在沙箱环境**不会触发**；
+ * 即便现网，推送丢失 / 服务重启期间也会漏单。文档明确建议
+ * 「推送丢失时调用 query_order 兜底」。本实现用于前端轮询查单时
+ * 库内 status='created' 时的兜底。
+ *
+ * API 规范（主版本文档 2.3 + 2.5 节）：
+ *   URL:    POST https://api.weixin.qq.com/xpay/query_order
+ *   uri:    /xpay/query_order
+ *   body:   { openid, env, order_id }    // order_id = outTradeNo
+ *   sign:   paySig = HMAC-SHA256(AppKey, '/xpay/query_order&' + post_body)
+ *
+ * 返回 order_status 枚举：1=待支付 2=已支付 3=已关闭 4=已退款
+ *
+ * @returns 微信订单状态；失败 / 超时返回 null（不影响前端轮询）
+ */
+export async function queryOrderFromWx(
+  openid: string,
+  outTradeNo: string
+): Promise<{ orderStatus: 1 | 2 | 3 | 4; wxOrderId: string | null } | null> {
+  const appKey = currentAppKey();
+  if (!appKey) {
+    logger.warn('vpay queryOrderFromWx: appKey missing');
+    return null;
+  }
+
+  const postBody = JSON.stringify({
+    openid,
+    env: config.vpay.env,
+    order_id: outTradeNo
+  });
+  const paySig = hmacSha256Hex(appKey, `/xpay/query_order&${postBody}`);
+
+  // 硬性 3s 上限：微信 API 通常 <1s 返回，超时直接当 null 让前端继续轮询
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 3000);
+
+  try {
+    const resp = await fetch('https://api.weixin.qq.com/xpay/query_order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...JSON.parse(postBody), pay_sig: paySig }),
+      signal: ac.signal
+    });
+    clearTimeout(timer);
+    const data = (await resp.json()) as {
+      errcode?: number;
+      errmsg?: string;
+      order_status?: number;
+      mch_order_no?: string;
+      transaction_id?: string;
+    };
+    if (data.errcode !== 0 || !data.order_status) {
+      logger.warn('vpay query_order failed', { outTradeNo, errcode: data.errcode, errmsg: data.errmsg });
+      return null;
+    }
+    const status = data.order_status as 1 | 2 | 3 | 4;
+    return {
+      orderStatus: status,
+      wxOrderId: data.mch_order_no || null
+    };
+  } catch (e: any) {
+    clearTimeout(timer);
+    logger.warn('vpay query_order error/timeout', { outTradeNo, err: e?.message });
+    return null;
+  }
 }
 
 /**

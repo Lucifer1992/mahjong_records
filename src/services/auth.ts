@@ -96,3 +96,29 @@ export async function getSessionKey(userId: string): Promise<string> {
   );
   return row?.session_key || '';
 }
+
+/**
+ * 支付前刷新 session_key（2026-09-29 加入）
+ *
+ * 背景：signature = HMAC-SHA256(session_key, signData)，库里存的 session_key
+ * 是上次登录时换的，隔几天就会失效 → wx.requestVirtualPayment 报
+ * SIGNATURE_INVALID(-15005)。官方实践：支付前前端重新 wx.login 拿新 code，
+ * 服务端用这个 code 换新 session_key 并立即用于签名。
+ *
+ * 安全校验：换出的 openid 必须与当前登录用户一致，防止拿别人的 code 刷新。
+ *
+ * @returns 新 session_key；失败（code 无效 / openid 不匹配）返回空串
+ */
+export async function refreshSessionKey(userId: string, code: string): Promise<string> {
+  const real = await fetchOpenidByCode(code);
+  if (!real?.sessionKey) return '';
+
+  const row = await db.queryOne<{ openid: string }>('SELECT openid FROM users WHERE id = ?', [userId]);
+  if (!row || row.openid !== real.openid) {
+    logger.warn('refreshSessionKey openid mismatch', { userId });
+    return '';
+  }
+
+  await db.exec('UPDATE users SET session_key = ? WHERE id = ?', [real.sessionKey, userId]);
+  return real.sessionKey;
+}

@@ -78,15 +78,15 @@ export const config = {
     /** 沙箱 AppKey（测试环境签名密钥） */
     sandboxAppKey: str(process.env.VPAY_SANDBOX_APP_KEY, '16WSLCnFyi2G8mHXkPxvTimiRjRCt6pw'),
     /**
-     * ⚠️ 现网 AppKey —— 真实收款的签名密钥，泄露即可被伪造支付签名。
-     * 刻意不预置、不进 git：部署时由铁匠手动填服务器 .env 的 VPAY_PROD_APP_KEY。
+     * ⚠️ 现网 AppKey —— 真扣款签名密钥，泄露即可被伪造支付签名。
+     * 不预置、不进 git：部署时由铁匠手动填服务器 .env 的 VPAY_PROD_APP_KEY。
      */
     prodAppKey: str(process.env.VPAY_PROD_APP_KEY, ''),
     /**
-     * 0 = 现网 / 1 = 沙箱。仅用于「选哪个 AppKey」：
-     *   VPAY_ENV=1 → 用 VPAY_SANDBOX_APP_KEY（联调）
-     *   VPAY_ENV=0 → 用 VPAY_PROD_APP_KEY（正式）
-     * 真实下发到 signData 的 env 字段固定是 0（官方文档明确要求）。
+     * 0 = 现网 / 1 = 沙箱。仅用于「选哪个 AppKey + signData 的 env 字段填什么」：
+     *   VPAY_ENV=1 → 用 VPAY_SANDBOX_APP_KEY 签 paySig，signData.env=1（开发联调，不真扣款）
+     *   VPAY_ENV=0 → 用 VPAY_PROD_APP_KEY 签 paySig，signData.env=0（生产，真扣款）
+     * 沙箱/现网必须同时一致（AppKey 和 env），错配 → -15005 SIGNATURE_INVALID。
      */
     env: num(process.env.VPAY_ENV, 1),
     products: {

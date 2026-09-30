@@ -11,26 +11,30 @@
 import { Router, json } from 'express';
 import { z } from 'zod';
 import { authRequired } from '../middleware/auth';
-import { getSessionKey } from '../services/auth';
+import { getSessionKey, refreshSessionKey } from '../services/auth';
 import {
-  createPrepay, isReady, getOrderByOutTradeNo,
-  verifyEchoSignature, verifyMsgSignature, handlePushBody,
+  createPrepay, isReady, getOrderByOutTradeNo, queryOrderFromWx,
+  verifyEchoSignature, verifyMsgSignature, handlePushBody, markOrderPaid,
   type ProductKey
 } from '../services/vpay';
+import { db } from '../db';
 import { logger } from '../logger';
 import { BizError } from '../middleware/error';
 
 const router = Router();
 
 const PrepaySchema = z.object({
-  product: z.enum(['lifetime'])   // 雀战录只提供 Pro 终身一档
+  product: z.enum(['lifetime']),  // 雀战录只提供 Pro 终身一档
+  // 前端支付前重新 wx.login 换的新 code：用于刷新 session_key（防过期 → SIGNATURE_INVALID）
+  code: z.string().min(1).optional()
 });
 
 /**
  * POST /prepay —— 创建订单 + 双签名
  *
- * 前端流程：调本接口 → 拿 signData/paySig/signature 调 wx.requestVirtualPayment
- * → success 后轮询 GET /order/:outTradeNo 等待履约（发货推送是异步的）。
+ * 前端流程：调本接口（建议带 wx.login 的新 code）→ 拿 signData/paySig/signature
+ * 调 wx.requestVirtualPayment → success 后轮询 GET /order/:outTradeNo 等待履约
+ * （发货推送是异步的）。
  */
 router.post('/prepay', authRequired, async (req, res, next) => {
   try {
@@ -39,8 +43,12 @@ router.post('/prepay', authRequired, async (req, res, next) => {
       return next(new BizError('VPAY_NOT_CONFIGURED', 503, `虚拟支付未就绪：${ready.message}`));
     }
 
-    const { product } = PrepaySchema.parse(req.body);
-    const sessionKey = await getSessionKey(req.user!.id);
+    const { product, code } = PrepaySchema.parse(req.body);
+
+    // 优先用前端刚 wx.login 换的新 code 刷新 session_key（旧值可能已过期）；
+    // 刷新失败（code 无效/过期）就退回库里的旧值，交给微信侧最终校验
+    let sessionKey = code ? await refreshSessionKey(req.user!.id, code) : '';
+    if (!sessionKey) sessionKey = await getSessionKey(req.user!.id);
     if (!sessionKey) {
       // 让前端知道要重新 wx.login 换新 session_key
       return next(new BizError('SESSION_KEY_MISSING', 409, '登录态过期，请重新登录后支付'));
@@ -107,8 +115,9 @@ router.post('/notify', async (req, res) => {
 });
 
 /**
- * GET /order/:outTradeNo —— 前端支付后轮询（发货推送有延迟）
- * 只能查自己的订单。
+ * GET /order/:outTradeNo —— 前端支付后轮询（发货推送有延迟 / 沙箱不推）
+ * 只能查自己的订单。**订单状态仍为 created 时主动调微信 query_order 兜底**，
+ * 解决沙箱环境不发货推送 + 现网推送丢失的问题。
  */
 router.get('/order/:outTradeNo', authRequired, async (req, res, next) => {
   try {
@@ -116,14 +125,33 @@ router.get('/order/:outTradeNo', authRequired, async (req, res, next) => {
     if (!order || order.user_id !== req.user!.id) {
       return next(new BizError('NOT_FOUND', 404, '订单不存在'));
     }
+
+    // 兜底：status=created 时主动查微信（沙箱不推 / 现网推送丢失场景）
+    let finalStatus = order.status;
+    if (order.status === 'created') {
+      const userRow = await db.queryOne<{ openid: string }>('SELECT openid FROM users WHERE id = ?', [order.user_id]);
+      if (userRow?.openid) {
+        const wx = await queryOrderFromWx(userRow.openid, order.out_trade_no);
+        if (wx?.orderStatus === 2) {
+          // 微信已支付但我们没收到推送 → 手动履约（幂等靠 wx_order_id UNIQUE + status='created' WHERE）
+          await markOrderPaid(order.out_trade_no, wx.wxOrderId, 'manual');
+          finalStatus = 'paid';
+          logger.info('vpay order reconciled via query_order', {
+            outTradeNo: order.out_trade_no, wxOrderId: wx.wxOrderId
+          });
+        }
+        // 其他状态（1/3/4）继续返回 created，由前端继续轮询或提示
+      }
+    }
+
     res.json({
       code: 0,
       data: {
         outTradeNo: order.out_trade_no,
-        status: order.status,          // created → paid（paid 即已升 Pro）
+        status: finalStatus,         // created → paid（paid 即已升 Pro）
         productKey: order.product_key,
         priceFen: order.price_fen,
-        paidAt: order.paid_at
+        paidAt: finalStatus === 'paid' ? Date.now() : null
       }
     });
   } catch (e) { next(e); }

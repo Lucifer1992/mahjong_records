@@ -311,12 +311,10 @@ info "✅ MySQL 连接与建表验证通过"
 
 # ----- 5. 编译 -----
 step "5/10 编译 TypeScript"
-if [ -d "dist" ] && [ "$MODE" != "reset" ]; then
-  info "dist 已存在,增量编译..."
-else
-  rm -rf dist
-  npm run build
-fi
+# ⚠️ 必须每次都编译（2026-10-01 修复：原「dist 已存在→增量编译」分支是空操作，
+#    导致 git pull 后 pm2 一直跑旧 dist，新代码永远不生效）
+rm -rf dist
+npm run build
 
 if [ ! -f "dist/index.js" ]; then
   err "编译失败: dist/index.js 不存在"

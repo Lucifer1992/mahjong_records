@@ -111,7 +111,14 @@ export async function getSessionKey(userId: string): Promise<string> {
  */
 export async function refreshSessionKey(userId: string, code: string): Promise<string> {
   const real = await fetchOpenidByCode(code);
-  if (!real?.sessionKey) return '';
+  if (!real?.sessionKey) {
+    // ⚠️ 静默失败分支（2026-10-01 排查 -15005 加日志）：这里如果不打日志，
+    // 外层会退回已被 jscode2session 作废的旧 key → 必然 SIGNATURE_INVALID
+    logger.warn('refreshSessionKey: jscode2session 未返回 sessionKey', {
+      userId, gotOpenid: !!real?.openid
+    });
+    return '';
+  }
 
   const row = await db.queryOne<{ openid: string }>('SELECT openid FROM users WHERE id = ?', [userId]);
   if (!row || row.openid !== real.openid) {
@@ -120,5 +127,6 @@ export async function refreshSessionKey(userId: string, code: string): Promise<s
   }
 
   await db.exec('UPDATE users SET session_key = ? WHERE id = ?', [real.sessionKey, userId]);
+  logger.info('refreshSessionKey: ok', { userId, keyLen: real.sessionKey.length });
   return real.sessionKey;
 }

@@ -48,11 +48,15 @@ router.post('/prepay', authRequired, async (req, res, next) => {
     // 优先用前端刚 wx.login 换的新 code 刷新 session_key（旧值可能已过期）；
     // 刷新失败（code 无效/过期）就退回库里的旧值，交给微信侧最终校验
     let sessionKey = code ? await refreshSessionKey(req.user!.id, code) : '';
+    const usedFreshKey = !!sessionKey;
     if (!sessionKey) sessionKey = await getSessionKey(req.user!.id);
     if (!sessionKey) {
       // 让前端知道要重新 wx.login 换新 session_key
       return next(new BizError('SESSION_KEY_MISSING', 409, '登录态过期，请重新登录后支付'));
     }
+    logger.info('vpay prepay sessionKey source', {
+      userId: req.user!.id, codeProvided: !!code, usedFreshKey, keyLen: sessionKey.length
+    });
 
     const params = await createPrepay(req.user!.id, product as ProductKey, sessionKey);
     res.json({ code: 0, data: params });

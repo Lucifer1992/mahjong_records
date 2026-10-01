@@ -75,8 +75,8 @@ export const config = {
   vpay: {
     /** 虚拟支付商户号（MP 后台 → 虚拟支付 → 基本配置） */
     offerId: str(process.env.VPAY_OFFER_ID, '1450649440'),
-    /** 沙箱 AppKey（测试环境签名密钥） */
-    sandboxAppKey: str(process.env.VPAY_SANDBOX_APP_KEY, '16WSLCnFyi2G8mHXkPxvTimiRjRCt6pw'),
+    /** 沙箱 AppKey（测试环境签名密钥）—— 故意不预置，部署时手动填 .env */
+    sandboxAppKey: str(process.env.VPAY_SANDBOX_APP_KEY, ''),
     /**
      * ⚠️ 现网 AppKey —— 真扣款签名密钥，泄露即可被伪造支付签名。
      * 不预置、不进 git：部署时由铁匠手动填服务器 .env 的 VPAY_PROD_APP_KEY。

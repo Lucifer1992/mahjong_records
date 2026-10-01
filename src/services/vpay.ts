@@ -290,6 +290,58 @@ export async function markOrderPaid(
   });
 }
 
+/**
+ * 退款完成：标记订单 refunded + 收回 Pro 权益（幂等）
+ *
+ * 触发：xpay_refund_notify 推送（RetCode=0 = 退款成功）。
+ * 规则：
+ *   - 只有 status='paid' 的订单才降级（幂等：重复推送第二次 0 行命中直接返回）
+ *   - 收回权益前检查该用户是否还有其他已支付订单——有则保留 Pro（多单场景）
+ *
+ * @returns 是否实际执行了降级（用于日志判断）
+ */
+export async function markOrderRefunded(outTradeNo: string): Promise<boolean> {
+  return db.withTransaction(async (conn) => {
+    const [rows] = await conn.query('SELECT * FROM vpay_orders WHERE out_trade_no = ?', [outTradeNo]);
+    const order = (rows as any[])[0];
+    if (!order) {
+      logger.warn('vpay markOrderRefunded: order not found', { outTradeNo });
+      return false;
+    }
+    if (order.status !== 'paid') {
+      // 未支付单 / 已退过 —— 幂等命中，不动作
+      logger.info('vpay markOrderRefunded: skip (status not paid)', { outTradeNo, status: order.status });
+      return false;
+    }
+
+    const [result] = await conn.query(
+      `UPDATE vpay_orders SET status = 'refunded' WHERE out_trade_no = ? AND status = 'paid'`,
+      [outTradeNo]
+    );
+    const affected = (result as any).affectedRows ?? 0;
+    if (affected === 0) return false; // 并发竞争中已处理
+
+    // 检查是否还有其他已支付订单（当前只有 lifetime 一档，理论必为 0，防御性查询）
+    const [others] = await conn.query(
+      `SELECT COUNT(*) AS n FROM vpay_orders WHERE user_id = ? AND status = 'paid' AND out_trade_no <> ?`,
+      [order.user_id, outTradeNo]
+    );
+    const otherPaid = Number((others as any[])[0]?.n ?? 0);
+
+    if (otherPaid === 0) {
+      await setTier(order.user_id, 'free');
+      logger.info('vpay order refunded, user downgraded to free', {
+        outTradeNo, userId: order.user_id
+      });
+    } else {
+      logger.info('vpay order refunded, user keeps pro (has other paid orders)', {
+        outTradeNo, userId: order.user_id, otherPaid
+      });
+    }
+    return true;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // 消息推送：GET 握手 + POST 推送（安全模式 AES 解密）
 // ---------------------------------------------------------------------------
@@ -359,6 +411,25 @@ export async function handlePushBody(body: Record<string, unknown>): Promise<{ o
     const wxPayInfo = (data.WeChatPayInfo ?? data.wechatpay_info ?? {}) as Record<string, unknown>;
     const wxOrderId = String(wxPayInfo.MchOrderNo ?? wxPayInfo.mch_order_no ?? '') || null;
     await markOrderPaid(outTradeNo, wxOrderId, 'notify');
+    return { ok: true, handled: true, event };
+  }
+
+  if (event === 'xpay_refund_notify') {
+    // 退款推送（文档 6.1）：MchOrderId = 原支付单的商户单号（outTradeNo），
+    // RetCode = 0 表示退款完成；收款后收回 Pro 权益（合规要求：退款不保留已购权益）
+    const data = (payload.Data ?? payload.data ?? payload) as Record<string, unknown>;
+    const outTradeNo = String(data.MchOrderId ?? data.mch_order_id ?? data.OutTradeNo ?? data.out_trade_no ?? '');
+    const retCode = Number(data.RetCode ?? data.ret_code ?? -1);
+    if (!outTradeNo) {
+      logger.error('vpay refund notify missing MchOrderId', { payload });
+      return { ok: false, handled: false, event };
+    }
+    if (retCode !== 0) {
+      // 退款未完成（进行中/失败），不动权益，等重推
+      logger.info('vpay refund notify: not completed, ignore', { outTradeNo, retCode, retMsg: data.RetMsg });
+      return { ok: true, handled: true, event };
+    }
+    await markOrderRefunded(outTradeNo);
     return { ok: true, handled: true, event };
   }
 

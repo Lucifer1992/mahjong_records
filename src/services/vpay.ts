@@ -112,6 +112,41 @@ export async function getOrderByOutTradeNo(outTradeNo: string): Promise<VpayOrde
 }
 
 /**
+ * 获取小程序全局接口调用凭证 access_token（内存缓存，提前 5 分钟过期）
+ *
+ * 服务端 API（/xpay/*）必须挂在 URL query 上（41001 = access_token missing）。
+ * 注意：与 wx-login 无关，这是 cgi-bin/token 的凭证，appid+secret 换取。
+ */
+let accessTokenCache: { token: string; expiresAt: number } | null = null;
+
+export async function getStableAccessToken(): Promise<string | null> {
+  if (accessTokenCache && Date.now() < accessTokenCache.expiresAt) {
+    return accessTokenCache.token;
+  }
+  const { appid, secret } = config.wechat;
+  if (!appid || !secret) {
+    logger.warn('getStableAccessToken: WX_APPID/WX_SECRET 未配置');
+    return null;
+  }
+  const url = `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${appid}&secret=${secret}`;
+  try {
+    const resp = await fetch(url);
+    const data = (await resp.json()) as { access_token?: string; expires_in?: number; errcode?: number; errmsg?: string };
+    if (!data.access_token) {
+      logger.warn('getStableAccessToken failed', { errcode: data.errcode, errmsg: data.errmsg });
+      return null;
+    }
+    const ttl = ((data.expires_in || 7200) - 300) * 1000; // 提前 5 分钟过期
+    accessTokenCache = { token: data.access_token, expiresAt: Date.now() + ttl };
+    logger.info('getStableAccessToken: refreshed', { keyLen: data.access_token.length, ttlMs: ttl });
+    return data.access_token;
+  } catch (e: any) {
+    logger.warn('getStableAccessToken error', { err: e?.message });
+    return null;
+  }
+}
+
+/**
  * 主动向微信查询订单状态（兜底发货推送）
  *
  * 背景：xpay_goods_deliver_notify 推送在沙箱环境**不会触发**；
@@ -120,10 +155,11 @@ export async function getOrderByOutTradeNo(outTradeNo: string): Promise<VpayOrde
  * 库内 status='created' 时的兜底。
  *
  * API 规范（主版本文档 2.3 + 2.5 节）：
- *   URL:    POST https://api.weixin.qq.com/xpay/query_order
+ *   URL:    POST https://api.weixin.qq.com/xpay/query_order?access_token=xxx&pay_sig=xxx
  *   uri:    /xpay/query_order
- *   body:   { openid, env, order_id }    // order_id = outTradeNo
+ *   body:   { openid, env, order_id }    // order_id = outTradeNo，纯业务字段
  *   sign:   paySig = HMAC-SHA256(AppKey, '/xpay/query_order&' + post_body)
+ *   auth:   access_token = cgi-bin/token 获取（服务端 API 必带，缺了报 41001）
  *
  * 返回 order_status 枚举：1=待支付 2=已支付 3=已关闭 4=已退款
  *
@@ -146,15 +182,24 @@ export async function queryOrderFromWx(
   });
   const paySig = hmacSha256Hex(appKey, `/xpay/query_order&${postBody}`);
 
+  // 服务端 API 必须带 access_token（41001 = access_token missing，2026-10-01 实测）
+  const accessToken = await getStableAccessToken();
+  if (!accessToken) {
+    logger.warn('vpay queryOrderFromWx: no access_token, skip');
+    return null;
+  }
+
   // 硬性 3s 上限：微信 API 通常 <1s 返回，超时直接当 null 让前端继续轮询
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 3000);
 
   try {
-    const resp = await fetch('https://api.weixin.qq.com/xpay/query_order', {
+    // pay_sig 挂 URL query（body 保持纯业务字段原文，与签名原文一致）
+    const url = `https://api.weixin.qq.com/xpay/query_order?access_token=${accessToken}&pay_sig=${paySig}`;
+    const resp = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...JSON.parse(postBody), pay_sig: paySig }),
+      body: postBody,
       signal: ac.signal
     });
     clearTimeout(timer);

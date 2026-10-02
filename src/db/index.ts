@@ -210,8 +210,24 @@ export async function initSchema(): Promise<void> {
 
 /**
  * 增量列迁移（CREATE TABLE IF NOT EXISTS 不会给存量表加列）
- * 用 information_schema 检查后 ALTER
+ *
+ * ⚠️ 必须幂等：PM2 重启竞态 / 双实例并发下，两个进程可能同时通过
+ * information_schema 检查、同时 ALTER —— 后到的会报 1060 (ER_DUP_FIELDNAME)。
+ * 撞到「列已存在」按成功处理，初始化不再因此退出（2026-10-02 现网实锤）。
  */
+async function addColumnIfMissing(table: string, column: string, ddl: string): Promise<void> {
+  try {
+    await pool.query(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+    logger.info(`MySQL migration: ${table}.${column} added`);
+  } catch (e: any) {
+    if (e?.errno === 1060 || e?.code === 'ER_DUP_FIELDNAME') {
+      logger.info(`MySQL migration: ${table}.${column} already exists, skip`);
+      return;
+    }
+    throw e;
+  }
+}
+
 async function migrateSchema(): Promise<void> {
   const cols = await query<{ COLUMN_NAME: string }>(
     `SELECT COLUMN_NAME FROM information_schema.COLUMNS
@@ -221,30 +237,16 @@ async function migrateSchema(): Promise<void> {
   const names = new Set(cols.map(c => c.COLUMN_NAME));
 
   if (!names.has('tier')) {
-    await pool.query(`ALTER TABLE users ADD COLUMN tier VARCHAR(16) NOT NULL DEFAULT 'free'`);
-    logger.info('MySQL migration: users.tier added');
+    await addColumnIfMissing('users', 'tier', `tier VARCHAR(16) NOT NULL DEFAULT 'free'`);
   }
   // 虚拟支付 signature = HMAC-SHA256(session_key, signData)，服务端必须持久化 session_key
   if (!names.has('session_key')) {
-    await pool.query(`ALTER TABLE users ADD COLUMN session_key VARCHAR(128) NOT NULL DEFAULT ''`);
-    logger.info('MySQL migration: users.session_key added');
+    await addColumnIfMissing('users', 'session_key', `session_key VARCHAR(128) NOT NULL DEFAULT ''`);
   }
 
   // vpay_orders 增量列：退款政策同意留痕（存量表 CREATE TABLE IF NOT EXISTS 不会补列）
-  const vpayCols = await query<{ COLUMN_NAME: string }>(
-    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
-     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'vpay_orders'`,
-    [config.mysql.database]
-  );
-  const vpNames = new Set(vpayCols.map(c => c.COLUMN_NAME));
-  if (!vpNames.has('policy_version')) {
-    await pool.query(`ALTER TABLE vpay_orders ADD COLUMN policy_version VARCHAR(16) NULL`);
-    logger.info('MySQL migration: vpay_orders.policy_version added');
-  }
-  if (!vpNames.has('policy_agreed_at')) {
-    await pool.query(`ALTER TABLE vpay_orders ADD COLUMN policy_agreed_at BIGINT NULL`);
-    logger.info('MySQL migration: vpay_orders.policy_agreed_at added');
-  }
+  await addColumnIfMissing('vpay_orders', 'policy_version', `policy_version VARCHAR(16) NULL`);
+  await addColumnIfMissing('vpay_orders', 'policy_agreed_at', `policy_agreed_at BIGINT NULL`);
 }
 
 // 启动即初始化（连不上直接退出，让 PM2 拉起重试）

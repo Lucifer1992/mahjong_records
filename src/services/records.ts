@@ -210,15 +210,10 @@ async function updatePlayerStats(conn: PoolConnection, players: ResolvedPlayer[]
   for (const r of rows as any[]) playerMap.set(r.id, r);
 
   // 单条 UPDATE 用 CASE/WHEN 批量累加
-  const sets = {
-    total_games: 'CASE id',
-    total_score: 'CASE id',
-    win_rate: 'CASE id',
-    current_streak: 'CASE id',
-    max_win_streak: 'CASE id',
-    max_lose_streak: 'CASE id'
-  } as Record<string, string>;
-  const params: any[] = [];
+  // ⚠️ 已废弃！原 CASE 批量写法 params（按玩家）与占位符（按列）顺序错位：
+  //    多人局时第 2+ 个玩家的值被写进错误的列、部分行 CASE 无命中得 NULL 撞 1048
+  //    （2026-10-02 实锤，players 表大量 NULL/错值统计即此 bug 长期污染所致）。
+  //    N ≤ 4 性能无意义，改为事务内逐玩家 UPDATE，参数一一对应不再可能错位。
   const idsOut: string[] = [];
 
   for (const p of players) {
@@ -247,30 +242,17 @@ async function updatePlayerStats(conn: PoolConnection, players: ResolvedPlayer[]
     const newWinCount = winCountBase + (1 / winnerCount);
     const finalWinRate = Math.round((newWinCount / totalGames) * 1000) / 10;
 
-    sets.total_games += ` WHEN ? THEN ?`;
-    sets.total_score += ` WHEN ? THEN ?`;
-    sets.win_rate += ` WHEN ? THEN ?`;
-    sets.current_streak += ` WHEN ? THEN ?`;
-    sets.max_win_streak += ` WHEN ? THEN ?`;
-    sets.max_lose_streak += ` WHEN ? THEN ?`;
-    params.push(p.playerId, totalGames, p.playerId, totalScore, p.playerId, finalWinRate,
-                p.playerId, currentStreak, p.playerId, maxWinStreak, p.playerId, maxLoseStreak);
+    await conn.query(
+      `UPDATE players SET
+         total_games = ?, total_score = ?, win_rate = ?,
+         current_streak = ?, max_win_streak = ?, max_lose_streak = ?
+       WHERE id = ?`,
+      [totalGames, totalScore, finalWinRate, currentStreak, maxWinStreak, maxLoseStreak, p.playerId]
+    );
     idsOut.push(p.playerId);
   }
 
   if (idsOut.length === 0) return;
-
-  // 关闭每个 CASE + 用 IN 限定行
-  const whereIn = idsOut.map(() => '?').join(',');
-  const sql = `UPDATE players SET
-    total_games = ${sets.total_games} END,
-    total_score = ${sets.total_score} END,
-    win_rate = ${sets.win_rate} END,
-    current_streak = ${sets.current_streak} END,
-    max_win_streak = ${sets.max_win_streak} END,
-    max_lose_streak = ${sets.max_lose_streak} END
-    WHERE id IN (${whereIn})`;
-  await conn.query(sql, [...params, ...idsOut]);
 }
 
 /**

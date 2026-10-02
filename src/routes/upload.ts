@@ -8,13 +8,12 @@
  */
 import { Router, Request, Response, NextFunction } from 'express';
 import multer from 'multer';
-import path from 'path';
 import fs from 'fs';
 import { authRequired } from '../middleware/auth';
 import { uuid } from '../utils/uuid';
 import { logger } from '../logger';
+import { AVATAR_DIR } from '../paths';
 
-const AVATAR_DIR = path.resolve(__dirname, '..', 'data', 'avatars');
 fs.mkdirSync(AVATAR_DIR, { recursive: true });
 
 const EXT_BY_MIME: Record<string, string> = {

@@ -8,6 +8,7 @@ import helmet from 'helmet';
 import compression from 'compression';
 import morgan from 'morgan';
 import { config } from './config';
+import { AVATAR_DIR } from './paths';
 import { logger } from './logger';
 import { rateLimit } from './middleware/rate-limit';
 import { notFound, errorHandler } from './middleware/error';
@@ -68,7 +69,8 @@ app.use('/api/upload', uploadRouter);
 app.use('/api/wxacode', wxacodeRouter);
 
   // 头像等用户素材静态服务（data/avatars → /avatars，经 Nginx 反代同样生效）
-  app.use('/avatars', express.static(path.resolve(__dirname, '..', 'data', 'avatars'), {
+  // 目录统一从 paths.ts 取（与 upload 写入同一目录，禁止自算）
+  app.use('/avatars', express.static(AVATAR_DIR, {
     maxAge: '30d',
     immutable: true
   }));

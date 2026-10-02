@@ -168,7 +168,7 @@ export async function getStableAccessToken(): Promise<string | null> {
 export async function queryOrderFromWx(
   openid: string,
   outTradeNo: string
-): Promise<{ orderStatus: 1 | 2 | 3 | 4; wxOrderId: string | null } | null> {
+): Promise<{ orderStatus: number; wxOrderId: string | null } | null> {
   const appKey = currentAppKey();
   if (!appKey) {
     logger.warn('vpay queryOrderFromWx: appKey missing');
@@ -206,9 +206,11 @@ export async function queryOrderFromWx(
     const data = (await resp.json()) as {
       errcode?: number;
       errmsg?: string;
-      // 官方文档 2.3：成功响应的订单信息嵌在 order 对象里（2026-10-02 实测 errcode=0
-      // 但顶层无 order_status，导致首单现网支付后对账失败——就是这里）
+      // 实测响应（2026-10-02 现网抓包）：订单信息嵌在 order 对象里，状态字段名是
+      // status（不是文档写的 order_status！），枚举（社区实锤 + 官方文档对照）：
+      //   1 = 已创建未支付；2/3/4 = 已支付（不同支付渠道细类）；5-8 = 已关闭/退款
       order?: {
+        status?: number;
         order_status?: number;
         wx_order_id?: string;
         out_trade_no?: string;
@@ -223,16 +225,16 @@ export async function queryOrderFromWx(
       return null;
     }
     const orderInfo = (data.order ?? data) as Record<string, unknown>;
-    const orderStatus = Number(orderInfo.order_status ?? 0);
+    const orderStatus = Number(orderInfo.status ?? orderInfo.order_status ?? 0);
     if (!orderStatus) {
-      // errcode=0 但没有 order_status → 响应结构未知，记原文排查
+      // errcode=0 但没有状态字段 → 响应结构未知，记原文排查
       logger.warn('vpay query_order: unexpected response shape', {
         outTradeNo, raw: JSON.stringify(data).slice(0, 400)
       });
       return null;
     }
     return {
-      orderStatus: orderStatus as 1 | 2 | 3 | 4,
+      orderStatus,
       // 平台单号官方字段 = wx_order_id（嵌在 order 里），mch_order_no 为旧字段兼容
       wxOrderId: String(orderInfo.wx_order_id ?? orderInfo.mch_order_no ?? '') || null
     };

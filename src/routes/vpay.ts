@@ -136,15 +136,16 @@ router.get('/order/:outTradeNo', authRequired, async (req, res, next) => {
       const userRow = await db.queryOne<{ openid: string }>('SELECT openid FROM users WHERE id = ?', [order.user_id]);
       if (userRow?.openid) {
         const wx = await queryOrderFromWx(userRow.openid, order.out_trade_no);
-        if (wx?.orderStatus === 2) {
+        // status 枚举（实测 2026-10-02）：2/3/4 = 已支付（不同渠道细类），1 = 未支付，5-8 = 关闭/退款
+        if (wx && wx.orderStatus >= 2 && wx.orderStatus <= 4) {
           // 微信已支付但我们没收到推送 → 手动履约（幂等靠 wx_order_id UNIQUE + status='created' WHERE）
           await markOrderPaid(order.out_trade_no, wx.wxOrderId, 'manual');
           finalStatus = 'paid';
           logger.info('vpay order reconciled via query_order', {
-            outTradeNo: order.out_trade_no, wxOrderId: wx.wxOrderId
+            outTradeNo: order.out_trade_no, wxOrderId: wx.wxOrderId, wxStatus: wx.orderStatus
           });
         }
-        // 其他状态（1/3/4）继续返回 created，由前端继续轮询或提示
+        // 其他状态（1 未支付 / 5-8 关闭退款）继续返回 created，由前端继续轮询或提示
       }
     }
 

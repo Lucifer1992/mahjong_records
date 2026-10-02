@@ -15,7 +15,8 @@ import { getSessionKey, refreshSessionKey } from '../services/auth';
 import {
   createPrepay, isReady, getOrderByOutTradeNo, queryOrderFromWx,
   verifyEchoSignature, verifyMsgSignature, handlePushBody, markOrderPaid,
-  type ProductKey
+  createRefundRequest, REFUND_POLICY_VERSION,
+  type ProductKey, type RefundCategory
 } from '../services/vpay';
 import { db } from '../db';
 import { logger } from '../logger';
@@ -26,7 +27,15 @@ const router = Router();
 const PrepaySchema = z.object({
   product: z.enum(['lifetime']),  // 雀战录只提供 Pro 终身一档
   // 前端支付前重新 wx.login 换的新 code：用于刷新 session_key（防过期 → SIGNATURE_INVALID）
-  code: z.string().min(1).optional()
+  code: z.string().min(1).optional(),
+  // 退款政策同意标记：前端支付弹窗已显著展示分层退款规则，用户点「立即解锁」即视为同意。
+  // 不传/传 false 直接拒绝 —— 没有留痕的订单，30 天后拒退就站不住（合规要求）
+  agreePolicy: z.literal(true)
+});
+
+const RefundRequestSchema = z.object({
+  category: z.enum(['unused', 'quality', 'other']),
+  reason: z.string().max(500).optional()
 });
 
 /**
@@ -43,7 +52,7 @@ router.post('/prepay', authRequired, async (req, res, next) => {
       return next(new BizError('VPAY_NOT_CONFIGURED', 503, `虚拟支付未就绪：${ready.message}`));
     }
 
-    const { product, code } = PrepaySchema.parse(req.body);
+    const { product, code, agreePolicy } = PrepaySchema.parse(req.body);
 
     // 优先用前端刚 wx.login 换的新 code 刷新 session_key（旧值可能已过期）；
     // 刷新失败（code 无效/过期）就退回库里的旧值，交给微信侧最终校验
@@ -58,7 +67,14 @@ router.post('/prepay', authRequired, async (req, res, next) => {
       userId: req.user!.id, codeProvided: !!code, usedFreshKey, keyLen: sessionKey.length
     });
 
-    const params = await createPrepay(req.user!.id, product as ProductKey, sessionKey);
+    // 政策留痕：记录同意时间 + 当时生效的政策版本（写入 vpay_orders）
+    const params = await createPrepay(req.user!.id, product as ProductKey, sessionKey, {
+      version: REFUND_POLICY_VERSION,
+      agreedAt: Date.now()
+    });
+    logger.info('vpay prepay policy agreed', {
+      userId: req.user!.id, agreePolicy, policyVersion: REFUND_POLICY_VERSION
+    });
     res.json({ code: 0, data: params });
   } catch (e) {
     if (e instanceof Error && e.message === 'SESSION_KEY_MISSING') {
@@ -66,6 +82,23 @@ router.post('/prepay', authRequired, async (req, res, next) => {
     }
     next(e);
   }
+});
+
+/**
+ * POST /refund-request —— 用户自助申请退款（分层政策评估）
+ *
+ * body: { category: 'unused' | 'quality' | 'other', reason?: string }
+ * 自动定位该用户最近的已支付订单，评估结果即时返回：
+ *   auto_refunded  → 已调 /xpay/refund_order 原路退回（7 天内未使用）
+ *   manual_review  → 人工核实（已使用 / 7~30 天 / 质量问题）
+ *   rejected       → 超 30 天（购买时已同意退款政策，政策留痕可查）
+ */
+router.post('/refund-request', authRequired, async (req, res, next) => {
+  try {
+    const { category, reason } = RefundRequestSchema.parse(req.body);
+    const result = await createRefundRequest(req.user!.id, category as RefundCategory, reason ?? '');
+    res.json({ code: 0, data: result });
+  } catch (e) { next(e); }
 });
 
 /**

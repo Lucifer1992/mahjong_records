@@ -153,12 +153,37 @@ const DDL = `
     product_id    VARCHAR(64)  NOT NULL,
     price_fen     INT          NOT NULL,
     status        VARCHAR(16)  NOT NULL DEFAULT 'created',
+    -- 退款政策同意留痕：prepay 时前端必须传 agreePolicy=true，
+    -- 记录当时生效的政策版本 + 同意时间（30 天后拒退的仲裁证据）
+    policy_version  VARCHAR(16) NULL,
+    policy_agreed_at BIGINT    NULL,
     created_at    BIGINT       NOT NULL,
     paid_at       BIGINT       NULL,
     UNIQUE KEY uk_vpay_out_trade_no (out_trade_no),
     UNIQUE KEY uk_vpay_wx_order_id (wx_order_id),
     KEY idx_vpay_orders_user (user_id),
     CONSTRAINT fk_vpay_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+  -- 退款申请：用户在小程序内自助提交，服务端按分层退款规则评估
+  --   7 天内未使用  → auto_refunded（自动原路退回）
+  --   其余情况      → manual_review（人工核实，质量问题不受 30 天限制）
+  --   超 30 天      → rejected（购买时已显著提示，保留政策版本作为证据）
+  CREATE TABLE IF NOT EXISTS vpay_refund_requests (
+    id            VARCHAR(36) PRIMARY KEY,
+    user_id       VARCHAR(36) NOT NULL,
+    out_trade_no  VARCHAR(40) NOT NULL,
+    category      VARCHAR(16) NOT NULL,          -- unused | quality | other
+    reason        VARCHAR(255) NOT NULL DEFAULT '',
+    decision      VARCHAR(16) NOT NULL,          -- auto_refunded | manual_review | rejected
+    days_since_paid INT NOT NULL DEFAULT 0,
+    used_after_purchase TINYINT NOT NULL DEFAULT 0,
+    policy_version VARCHAR(16) NULL,
+    refund_order_id VARCHAR(64) NULL,
+    created_at    BIGINT NOT NULL,
+    KEY idx_refund_req_user (user_id),
+    KEY idx_refund_req_order (out_trade_no),
+    CONSTRAINT fk_refund_req_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
   -- 意见反馈：只存 user_id + 内容 + 时间戳；不收集手机号/姓名/IP 等敏感信息
@@ -203,6 +228,22 @@ async function migrateSchema(): Promise<void> {
   if (!names.has('session_key')) {
     await pool.query(`ALTER TABLE users ADD COLUMN session_key VARCHAR(128) NOT NULL DEFAULT ''`);
     logger.info('MySQL migration: users.session_key added');
+  }
+
+  // vpay_orders 增量列：退款政策同意留痕（存量表 CREATE TABLE IF NOT EXISTS 不会补列）
+  const vpayCols = await query<{ COLUMN_NAME: string }>(
+    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'vpay_orders'`,
+    [config.mysql.database]
+  );
+  const vpNames = new Set(vpayCols.map(c => c.COLUMN_NAME));
+  if (!vpNames.has('policy_version')) {
+    await pool.query(`ALTER TABLE vpay_orders ADD COLUMN policy_version VARCHAR(16) NULL`);
+    logger.info('MySQL migration: vpay_orders.policy_version added');
+  }
+  if (!vpNames.has('policy_agreed_at')) {
+    await pool.query(`ALTER TABLE vpay_orders ADD COLUMN policy_agreed_at BIGINT NULL`);
+    logger.info('MySQL migration: vpay_orders.policy_agreed_at added');
   }
 }
 

@@ -18,6 +18,20 @@ import { setTier } from './users';
 
 export type ProductKey = 'lifetime';
 
+/**
+ * 退款政策版本（分层退款规则）
+ *
+ * 政策内容（须与前端支付弹窗文案 + 用户协议第 4 条保持一致）：
+ *   1. 付款 7 天内且未使用 Pro 权益（付费后无新战绩同步）→ 自动全额退款
+ *   2. 功能故障 / 产品问题 → 不受期限限制，人工核实处理
+ *   3. 付款 7 天内已使用 / 7~30 天 → 人工核实
+ *   4. 付款超 30 天 → 虚拟服务已持续提供，不支持退款（质量问题除外）
+ *
+ * 每次修改政策文案必须升版本号：prepay 时写入 vpay_orders.policy_version，
+ * 作为「购买时用户同意了哪个版本」的仲裁证据。
+ */
+export const REFUND_POLICY_VERSION = '2026-10-02';
+
 export interface VpayOrderRow {
   id: string;
   user_id: string;
@@ -61,7 +75,8 @@ function hmacSha256Hex(key: string, data: string): string {
 export async function createPrepay(
   userId: string,
   productKey: ProductKey,
-  sessionKey: string
+  sessionKey: string,
+  policy: { version: string; agreedAt: number }
 ): Promise<{ signData: string; paySig: string; signature: string; outTradeNo: string; priceFen: number; label: string }> {
   const product = config.vpay.products[productKey];
   if (!product) throw new Error(`unknown product key: ${productKey}`);
@@ -92,9 +107,9 @@ export async function createPrepay(
   const signature = hmacSha256Hex(sessionKey, signData);
 
   await db.exec(
-    `INSERT INTO vpay_orders (id, user_id, out_trade_no, product_key, product_id, price_fen, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, 'created', ?)`,
-    [uuid(), userId, outTradeNo, productKey, product.productId, product.priceFen, Date.now()]
+    `INSERT INTO vpay_orders (id, user_id, out_trade_no, product_key, product_id, price_fen, status, policy_version, policy_agreed_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'created', ?, ?, ?)`,
+    [uuid(), userId, outTradeNo, productKey, product.productId, product.priceFen, policy.version, policy.agreedAt, Date.now()]
   );
 
   return { signData, paySig, signature, outTradeNo, priceFen: product.priceFen, label: product.label };
@@ -359,6 +374,229 @@ export async function markOrderRefunded(outTradeNo: string): Promise<boolean> {
     }
     return true;
   });
+}
+
+// ---------------------------------------------------------------------------
+// 退款：分层政策评估 + /xpay/refund_order 原路退回
+// ---------------------------------------------------------------------------
+
+/** 用户提交的退款原因分类 */
+export type RefundCategory = 'unused' | 'quality' | 'other';
+
+/** 分层政策评估结果 */
+export type RefundDecision = 'auto_refunded' | 'manual_review' | 'rejected';
+
+export interface RefundRequestResult {
+  decision: RefundDecision;
+  message: string;
+  daysSincePaid: number;
+  usedAfterPurchase: boolean;
+}
+
+/**
+ * 调微信 /xpay/refund_order 启动退款任务（原路退回）
+ *
+ * API 规范（与 query_order 同族）：
+ *   URL:  POST https://api.weixin.qq.com/xpay/refund_order?access_token=xxx&pay_sig=xxx
+ *   sign: paySig = HMAC-SHA256(AppKey, '/xpay/refund_order&' + post_body)
+ *   body: { openid, env, order_id, refund_order_id, refund_fee, left_fee, refund_reason, req_from }
+ *
+ * 注意：本接口只是「启动」退款任务，最终状态靠 xpay_refund_notify 推送确认
+ * （handlePushBody 里已处理：退款完成 → markOrderRefunded 收回 Pro）。
+ *
+ * @returns 是否启动成功
+ */
+export async function refundOrderFromWx(
+  openid: string,
+  outTradeNo: string,
+  refundFeeFen: number
+): Promise<boolean> {
+  const appKey = currentAppKey();
+  if (!appKey) {
+    logger.warn('vpay refundOrderFromWx: appKey missing');
+    return false;
+  }
+  const accessToken = await getStableAccessToken();
+  if (!accessToken) {
+    logger.warn('vpay refundOrderFromWx: no access_token, skip');
+    return false;
+  }
+
+  // refund_order_id：8-32 字符，字母/数字/_/-（RF + 毫秒时间戳 + 4 位随机 = 19 字符）
+  const refundOrderId = `RF${Date.now()}${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+
+  const postBody = JSON.stringify({
+    openid,
+    env: config.vpay.env,
+    order_id: outTradeNo,
+    refund_order_id: refundOrderId,
+    refund_fee: refundFeeFen,   // 单位分
+    left_fee: refundFeeFen,     // 首笔全额退款：剩余可退 = 全额
+    refund_reason: 3,           // 3 = 意愿问题（用户主动退款）
+    req_from: 2                 // 2 = 用户自己发起
+  });
+  const paySig = hmacSha256Hex(appKey, `/xpay/refund_order&${postBody}`);
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 5000);
+
+  try {
+    const url = `https://api.weixin.qq.com/xpay/refund_order?access_token=${accessToken}&pay_sig=${paySig}`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: postBody,
+      signal: ac.signal
+    });
+    clearTimeout(timer);
+    const data = (await resp.json()) as { errcode?: number; errmsg?: string; refund_order_id?: string };
+    if (Number(data.errcode ?? 0) !== 0) {
+      logger.error('vpay refund_order failed', { outTradeNo, errcode: data.errcode, errmsg: data.errmsg });
+      return false;
+    }
+    logger.info('vpay refund_order started', { outTradeNo, refundOrderId: data.refund_order_id ?? refundOrderId });
+    return true;
+  } catch (e: any) {
+    clearTimeout(timer);
+    logger.error('vpay refund_order error/timeout', { outTradeNo, err: e?.message });
+    return false;
+  }
+}
+
+/**
+ * 判断用户付费后是否「使用过 Pro 权益」
+ *
+ * 口径：付费时间之后有新的战绩同步（云端写入或更新）即算已使用。
+ * （克星榜/月度报表等分析功能在前端本地计算，服务端无法观测，
+ *  取「付费后是否还在活跃写数据」作为最接近的可验证口径。）
+ */
+async function hasUsedProAfterPurchase(userId: string, paidAt: number): Promise<boolean> {
+  const row = await db.queryOne<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM records
+     WHERE user_id = ? AND (created_at >= ? OR updated_at >= ?)`,
+    [userId, paidAt, paidAt]
+  );
+  return Number(row?.n ?? 0) > 0;
+}
+
+/**
+ * 用户提交退款申请：按分层政策评估并执行
+ *
+ * 决策表（政策版本 ${REFUND_POLICY_VERSION}）：
+ *   功能故障（quality）     → manual_review（任何时段，人工核实）
+ *   付款超 30 天            → rejected（质量问题除外，见上）
+ *   ≤7 天且付费后无新同步   → auto_refunded（调 refund_order 全额退 + 立即降级）
+ *   ≤7 天但已使用           → manual_review
+ *   7~30 天                 → manual_review
+ */
+export async function createRefundRequest(
+  userId: string,
+  category: RefundCategory,
+  reasonText: string
+): Promise<RefundRequestResult> {
+  // 1. 找最近的已支付订单
+  const order = await db.queryOne<any>(
+    `SELECT * FROM vpay_orders WHERE user_id = ? AND status = 'paid' ORDER BY paid_at DESC LIMIT 1`,
+    [userId]
+  );
+  if (!order) {
+    // 已退款 / 未登录过支付 —— 给出明确提示
+    const refunded = await db.queryOne<any>(
+      `SELECT out_trade_no FROM vpay_orders WHERE user_id = ? AND status = 'refunded' LIMIT 1`,
+      [userId]
+    );
+    return {
+      decision: 'rejected',
+      message: refunded ? '该订单已退款完成。' : '没有找到可申请退款的订单。',
+      daysSincePaid: 0,
+      usedAfterPurchase: false
+    };
+  }
+  const outTradeNo = String(order.out_trade_no);
+  const paidAt = Number(order.paid_at ?? order.created_at);
+  const daysSincePaid = Math.floor((Date.now() - paidAt) / 86400000);
+  const usedAfterPurchase = await hasUsedProAfterPurchase(userId, paidAt);
+
+  // 2. 防重复申请：同订单已有未终态/已退款的申请直接幂等返回
+  const existing = await db.queryOne<any>(
+    `SELECT decision FROM vpay_refund_requests
+     WHERE out_trade_no = ? AND decision IN ('auto_refunded', 'manual_review')
+     ORDER BY created_at DESC LIMIT 1`,
+    [outTradeNo]
+  );
+  if (existing) {
+    return {
+      decision: existing.decision,
+      message: existing.decision === 'auto_refunded'
+        ? '退款已受理，款项原路退回微信支付（1-3 个工作日到账），Pro 权益已收回。'
+        : '你的退款申请已在人工核实中，我们会在 48 小时内处理，请勿重复提交。',
+      daysSincePaid,
+      usedAfterPurchase
+    };
+  }
+
+  // 3. 分层评估
+  let decision: RefundDecision;
+  let message: string;
+  if (category === 'quality') {
+    // 质量问题不受 30 天限制（消法要求 + 平台仲裁倾向）
+    decision = 'manual_review';
+    message = '已收到你的问题反馈，我们会在 48 小时内人工核实处理，核实属实将全额退款。';
+  } else if (daysSincePaid > 30) {
+    decision = 'rejected';
+    message = '本订单已付款超过 30 天，虚拟服务已持续提供，按购买时同意的退款规则不支持退款。'
+      + '如遇功能故障，请以「功能故障」原因重新提交。';
+  } else if (daysSincePaid <= 7 && !usedAfterPurchase) {
+    decision = 'auto_refunded';
+    message = '退款已受理，¥9.9 将原路退回微信支付（1-3 个工作日到账），Pro 权益同步收回。';
+  } else if (daysSincePaid <= 7) {
+    decision = 'manual_review';
+    message = '检测到你在付款后使用过 Pro 权益，申请已转人工核实，48 小时内处理。';
+  } else {
+    decision = 'manual_review';
+    message = `已收到你的申请（付款后第 ${daysSincePaid} 天），转人工核实，48 小时内处理。`;
+  }
+
+  // 4. 自动退款：启动微信退款任务；启动成功即收回 Pro（宁可晚到账，不让「已退款仍持有 Pro」）
+  let refundOrderId: string | null = null;
+  if (decision === 'auto_refunded') {
+    const userRow = await db.queryOne<{ openid: string }>('SELECT openid FROM users WHERE id = ?', [userId]);
+    if (!userRow?.openid) {
+      logger.error('vpay refund request: user openid missing, fallback to manual', { userId, outTradeNo });
+      decision = 'manual_review';
+      message = '退款申请已提交，转人工核实，48 小时内处理。';
+    } else {
+      const ok = await refundOrderFromWx(userRow.openid, outTradeNo, Number(order.price_fen));
+      if (ok) {
+        refundOrderId = 'started';  // 具体单号微信未回传，用标记占位；最终以 refund notify 为准
+        await markOrderRefunded(outTradeNo);
+      } else {
+        // 退款 API 失败（网络/微信侧）→ 转人工，不让用户卡死
+        logger.error('vpay refund_order start failed, fallback to manual_review', { outTradeNo });
+        decision = 'manual_review';
+        message = '退款申请已提交，转人工核实，48 小时内处理。';
+      }
+    }
+  }
+
+  // 5. 留痕（决策依据快照入库，人工核实/仲裁时可追溯）
+  await db.exec(
+    `INSERT INTO vpay_refund_requests
+       (id, user_id, out_trade_no, category, reason, decision, days_since_paid,
+        used_after_purchase, policy_version, refund_order_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      uuid(), userId, outTradeNo, category, reasonText.slice(0, 255), decision,
+      daysSincePaid, usedAfterPurchase ? 1 : 0,
+      order.policy_version ?? null, refundOrderId, Date.now()
+    ]
+  );
+  logger.info('vpay refund request created', {
+    userId, outTradeNo, category, decision, daysSincePaid, usedAfterPurchase,
+    policyVersion: order.policy_version
+  });
+
+  return { decision, message, daysSincePaid, usedAfterPurchase };
 }
 
 // ---------------------------------------------------------------------------

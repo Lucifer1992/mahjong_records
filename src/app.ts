@@ -17,7 +17,6 @@ import recordsRouter from './routes/records';
 import usersRouter from './routes/users';
 import vpayRouter from './routes/vpay';
 import uploadRouter from './routes/upload';
-import feedbackRouter from './routes/feedback';
 import wxacodeRouter from './routes/wxacode';
 
 export function createApp(): Application {
@@ -65,7 +64,7 @@ export function createApp(): Application {
   app.use('/api/users', usersRouter);
 app.use('/api/vpay', vpayRouter);
 app.use('/api/upload', uploadRouter);
-app.use('/api/feedback', feedbackRouter);
+// （/api/feedback 已下线：反馈统一走小程序「联系客服」open-type=contact；feedback 表保留）
 app.use('/api/wxacode', wxacodeRouter);
 
   // 头像等用户素材静态服务（data/avatars → /avatars，经 Nginx 反代同样生效）

@@ -11,6 +11,7 @@ import { findOrCreate, findOrCreateByConn } from './players';
 import { getTier } from './users';
 import { config } from '../config';
 import { BizError } from '../middleware/error';
+import { logger } from '../logger';
 
 export interface PlayerScoreInput {
   playerId?: string;     // 已存在玩家时传；不传则按 nickname 自动建
@@ -400,6 +401,9 @@ async function insertRecord(userId: string, input: RecordInput): Promise<RecordO
         );
         if (!(own as any[])[0]) {
           const player = await findOrCreateByConn(conn, userId, p.nickname);
+          logger.warn('records: stale playerId, rematched by nickname', {
+            recordId, nickname: p.nickname, staleId: pid, resolvedId: player.id
+          });
           pid = player.id;
         }
       }
@@ -453,6 +457,13 @@ export async function batchCreate(userId: string, records: RecordInput[]): Promi
       results.push({ id: out.id, ok: true });
       success++;
     } catch (e: any) {
+      // 逐条失败必须留痕：前端只展示计数，原因只能靠服务端日志定位
+      logger.warn('batchCreate: record rejected', {
+        recordId: r.id,
+        err: e?.message,
+        errCode: e instanceof BizError ? e.code : undefined,
+        at: e?.stack?.split('\n').slice(1, 3).join(' | ')
+      });
       results.push({ id: r.id, ok: false, error: e.message });
       failed++;
     }

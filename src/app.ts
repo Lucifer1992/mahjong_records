@@ -18,6 +18,7 @@ import usersRouter from './routes/users';
 import vpayRouter from './routes/vpay';
 import uploadRouter from './routes/upload';
 import feedbackRouter from './routes/feedback';
+import wxacodeRouter from './routes/wxacode';
 
 export function createApp(): Application {
   const app = express();
@@ -65,6 +66,7 @@ export function createApp(): Application {
 app.use('/api/vpay', vpayRouter);
 app.use('/api/upload', uploadRouter);
 app.use('/api/feedback', feedbackRouter);
+app.use('/api/wxacode', wxacodeRouter);
 
   // 头像等用户素材静态服务（data/avatars → /avatars，经 Nginx 反代同样生效）
   app.use('/avatars', express.static(path.resolve(__dirname, '..', 'data', 'avatars'), {

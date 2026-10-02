@@ -206,18 +206,35 @@ export async function queryOrderFromWx(
     const data = (await resp.json()) as {
       errcode?: number;
       errmsg?: string;
+      // 官方文档 2.3：成功响应的订单信息嵌在 order 对象里（2026-10-02 实测 errcode=0
+      // 但顶层无 order_status，导致首单现网支付后对账失败——就是这里）
+      order?: {
+        order_status?: number;
+        wx_order_id?: string;
+        out_trade_no?: string;
+      };
+      // 兼容：旧文档/平铺字段
       order_status?: number;
       mch_order_no?: string;
-      transaction_id?: string;
     };
-    if (data.errcode !== 0 || !data.order_status) {
+    const errcode = Number(data.errcode ?? 0);
+    if (errcode !== 0) {
       logger.warn('vpay query_order failed', { outTradeNo, errcode: data.errcode, errmsg: data.errmsg });
       return null;
     }
-    const status = data.order_status as 1 | 2 | 3 | 4;
+    const orderInfo = (data.order ?? data) as Record<string, unknown>;
+    const orderStatus = Number(orderInfo.order_status ?? 0);
+    if (!orderStatus) {
+      // errcode=0 但没有 order_status → 响应结构未知，记原文排查
+      logger.warn('vpay query_order: unexpected response shape', {
+        outTradeNo, raw: JSON.stringify(data).slice(0, 400)
+      });
+      return null;
+    }
     return {
-      orderStatus: status,
-      wxOrderId: data.mch_order_no || null
+      orderStatus: orderStatus as 1 | 2 | 3 | 4,
+      // 平台单号官方字段 = wx_order_id（嵌在 order 里），mch_order_no 为旧字段兼容
+      wxOrderId: String(orderInfo.wx_order_id ?? orderInfo.mch_order_no ?? '') || null
     };
   } catch (e: any) {
     clearTimeout(timer);

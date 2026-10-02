@@ -387,12 +387,17 @@ async function insertRecord(userId: string, input: RecordInput): Promise<RecordO
         const player = await findOrCreateByConn(conn, userId, p.nickname);
         pid = player.id;
       } else {
-        // 校验 playerId 归属
+        // 校验 playerId 归属；不存在 → **降级**按昵称匹配/建档，而不是拒绝。
+        // 场景：MySQL 迁移 / 换设备后玩家 id 变了，旧战绩还挂着旧 id ——
+        // 直接拒绝会让这批记录永远卡在「N 条失败」（2026-10-02 现网实锤）。
         const [own] = await conn.query(
           'SELECT id FROM players WHERE id = ? AND user_id = ?',
           [pid, userId]
         );
-        if (!(own as any[])[0]) throw new BizError('PLAYER_NOT_FOUND', 400, `玩家 ${p.nickname} 不存在`);
+        if (!(own as any[])[0]) {
+          const player = await findOrCreateByConn(conn, userId, p.nickname);
+          pid = player.id;
+        }
       }
 
       await conn.query(

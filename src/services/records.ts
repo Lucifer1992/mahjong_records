@@ -224,22 +224,26 @@ async function updatePlayerStats(conn: PoolConnection, players: ResolvedPlayer[]
     const player = playerMap.get(p.playerId);
     if (!player) continue;
 
-    const totalGames = player.total_games + 1;
-    const totalScore = player.total_score + p.score;
+    // ⚠️ NULL 安全：统计列是后来 ALTER 加的，历史玩家行可能是 NULL
+    // （2026-10-02 实锤：NULL + 1 = NULL，写回撞 1048 cannot be null → 整条同步失败）
+    const totalGames = Number(player.total_games || 0) + 1;
+    const totalScore = Number(player.total_score || 0) + p.score;
 
     // streak：赢家 +1，输家 -1，0 重置
-    let currentStreak: number, maxWinStreak = player.max_win_streak, maxLoseStreak = player.max_lose_streak;
+    const curStreak = Number(player.current_streak || 0);
+    let currentStreak: number, maxWinStreak = Number(player.max_win_streak || 0), maxLoseStreak = Number(player.max_lose_streak || 0);
     if (p.score > 0) {
-      currentStreak = player.current_streak >= 0 ? player.current_streak + 1 : 1;
+      currentStreak = curStreak >= 0 ? curStreak + 1 : 1;
       if (currentStreak > maxWinStreak) maxWinStreak = currentStreak;
     } else if (p.score < 0) {
-      currentStreak = player.current_streak <= 0 ? player.current_streak - 1 : -1;
+      currentStreak = curStreak <= 0 ? curStreak - 1 : -1;
       if (-currentStreak > maxLoseStreak) maxLoseStreak = -currentStreak;
     } else {
       currentStreak = 0;
     }
 
-    const newWinCount = (player.total_games * player.win_rate / 100) + (1 / winnerCount);
+    const winCountBase = Number(player.total_games || 0) * Number(player.win_rate || 0) / 100;
+    const newWinCount = winCountBase + (1 / winnerCount);
     const finalWinRate = Math.round((newWinCount / totalGames) * 1000) / 10;
 
     sets.total_games += ` WHEN ? THEN ?`;

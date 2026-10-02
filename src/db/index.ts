@@ -247,6 +247,16 @@ async function migrateSchema(): Promise<void> {
   // vpay_orders 增量列：退款政策同意留痕（存量表 CREATE TABLE IF NOT EXISTS 不会补列）
   await addColumnIfMissing('vpay_orders', 'policy_version', `policy_version VARCHAR(16) NULL`);
   await addColumnIfMissing('vpay_orders', 'policy_agreed_at', `policy_agreed_at BIGINT NULL`);
+
+  // players 统计列历史 NULL 回填（列是后加的，旧行为 NULL → updatePlayerStats 算出 NULL 撞 1048）。
+  // 只更新 NULL 行，天然幂等；updatePlayerStats 里也已做 NULL 安全兜底，这里是数据层面清根
+  await pool.query(
+    `UPDATE players SET
+       total_games = 0, total_score = 0, win_rate = 0,
+       current_streak = 0, max_win_streak = 0, max_lose_streak = 0
+     WHERE total_games IS NULL OR total_score IS NULL OR win_rate IS NULL
+        OR current_streak IS NULL OR max_win_streak IS NULL OR max_lose_streak IS NULL`
+  );
 }
 
 // 启动即初始化（连不上直接退出，让 PM2 拉起重试）

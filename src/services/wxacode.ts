@@ -62,6 +62,13 @@ async function getAccessToken(): Promise<string> {
 
 /**
  * 获取战绩海报用的小程序码 PNG buffer（scene 固定，落盘缓存）
+ *
+ * 环境策略：
+ * 1. 优先按 WXACODE_ENV_VERSION（默认 release，体验期设 trial）生成，check_path=true
+ * 2. trial 生成遇 41030（体验版未上传/页面不存在）→ **自动降级**：
+ *    用 env=release + check_path=false 生成正式版码。该码发布前扫码提示
+ *    「小程序不存在」，正式发布后即变为可正常跳转的正式码（无需重新生成）
+ * 3. release 环境遇 41030 → 真问题（页面路径改名），抛错带提示
  */
 export async function getPosterWxacode(): Promise<Buffer> {
   // 磁盘缓存命中 → 直接返回
@@ -76,50 +83,70 @@ export async function getPosterWxacode(): Promise<Buffer> {
 
   const token = await getAccessToken();
   const url = `https://api.weixin.qq.com/wxa/getwxacodeunlimit?access_token=${token}`;
-  const body = JSON.stringify({
-    scene: 'from=poster',
-    page: 'pages/index/index',
-    width: 430,
-    auto_color: false,
-    line_color: { r: 74, g: 157, b: 126 },
-    check_path: true,
-    // release=正式版（默认）/ trial=体验版（未发布期间配 WXACODE_ENV_VERSION=trial）
-    env_version: config.wechat.wxacodeEnv
-  });
-  // ⚠️ 必须显式带 Content-Length：Node 默认 chunked 传输，api.weixin.qq.com
-  // 有概率直接 socket hang up（2026-10-03 现网实锤）
-  const raw = await new Promise<Buffer>((resolve, reject) => {
-    const attempt = (retries: number) => {
-      const req = https.request(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-        timeout: 15000
-      }, (res) => {
-        const chunks: Buffer[] = [];
-        res.on('data', (c: Buffer) => chunks.push(c));
-        res.on('end', () => resolve(Buffer.concat(chunks)));
-      });
-      req.on('error', (e) => {
-        if (retries > 0) return attempt(retries - 1);
-        reject(e);
-      });
-      req.on('timeout', () => { req.destroy(new Error('request timeout')); });
-      req.write(body);
-      req.end();
-    };
-    attempt(1);
-  });
+  const page = 'pages/index/index';
 
-  // 微信出错时返回 JSON（首字节 '{'），成功时返回图片二进制
-  if (raw.length > 0 && raw[0] === 0x7B) {
-    let err: any = {};
-    try { err = JSON.parse(raw.toString('utf8')); } catch { /* ignore */ }
-    logger.warn('getwxacodeunlimit failed', { errcode: err.errcode, errmsg: err.errmsg, env: config.wechat.wxacodeEnv });
-    if (err.errcode === 41030) {
-      throw new Error(`生成小程序码失败: 41030 page 不存在 —— env=${config.wechat.wxacodeEnv}，` +
-        (config.wechat.wxacodeEnv === 'release' ? '小程序未发布或页面路径不匹配；体验版期间可设 WXACODE_ENV_VERSION=trial' : '体验版未上传该页面，请先在开发者工具上传体验版'));
+  const genCode = async (envVersion: string, checkPath: boolean): Promise<Buffer> => {
+    const body = JSON.stringify({
+      scene: 'from=poster',
+      page,
+      width: 430,
+      auto_color: false,
+      line_color: { r: 74, g: 157, b: 126 },
+      check_path: checkPath,
+      env_version: envVersion
+    });
+    // ⚠️ 必须显式带 Content-Length：Node 默认 chunked 传输，api.weixin.qq.com
+    // 有概率直接 socket hang up（2026-10-03 现网实锤）
+    return new Promise<Buffer>((resolve, reject) => {
+      const attempt = (retries: number) => {
+        const req = https.request(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+          timeout: 15000
+        }, (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c: Buffer) => chunks.push(c));
+          res.on('end', () => resolve(Buffer.concat(chunks)));
+        });
+        req.on('error', (e) => {
+          if (retries > 0) return attempt(retries - 1);
+          reject(e);
+        });
+        req.on('timeout', () => { req.destroy(new Error('request timeout')); });
+        req.write(body);
+        req.end();
+      };
+      attempt(1);
+    });
+  };
+
+  /** 解析微信错误响应；非 JSON 错误返回 null */
+  const parseWxError = (raw: Buffer): { errcode: number; errmsg: string } | null => {
+    if (raw.length > 0 && raw[0] === 0x7B) {
+      try {
+        const err = JSON.parse(raw.toString('utf8'));
+        return { errcode: err.errcode, errmsg: err.errmsg };
+      } catch { /* ignore */ }
     }
-    throw new Error(`生成小程序码失败: ${err.errcode} ${err.errmsg}`);
+    return null;
+  };
+
+  let raw = await genCode(config.wechat.wxacodeEnv, true);
+  let wxErr = parseWxError(raw);
+
+  // 体验版 41030（未上传体验版/页面缺失）→ 降级生成 release 码（发布前仅展示，发布后即可扫）
+  if (wxErr?.errcode === 41030 && config.wechat.wxacodeEnv !== 'release') {
+    logger.warn('wxacode trial 41030, fallback to release + check_path=false', { page });
+    raw = await genCode('release', false);
+    wxErr = parseWxError(raw);
+  }
+
+  if (wxErr) {
+    logger.warn('getwxacodeunlimit failed', { ...wxErr, env: config.wechat.wxacodeEnv });
+    if (wxErr.errcode === 41030) {
+      throw new Error(`生成小程序码失败: 41030 page 不存在 —— env=release 校验失败，请确认 appid 对应的小程序已包含页面 ${page}`);
+    }
+    throw new Error(`生成小程序码失败: ${wxErr.errcode} ${wxErr.errmsg}`);
   }
 
   // 空响应（连接被掐断等）绝不能当成功缓存 —— 2026-10-03 实锤缓存了 0 字节文件

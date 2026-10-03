@@ -44,7 +44,14 @@ export const config = {
 
   wechat: {
     appid: str(process.env.WX_APPID, ''),
-    secret: str(process.env.WX_SECRET, '')
+    secret: str(process.env.WX_SECRET, ''),
+    /**
+     * 小程序码 env_version：release（正式版）/ trial（体验版）/ develop
+     * 小程序未发布时 getwxacodeunlimit 会校验 page 在正式版存在 → 41030 出不了码，
+     * 体验版期间在服务器 .env 设 WXACODE_ENV_VERSION=trial（码只有体验成员能扫）；
+     * 正式发布后删掉该变量（默认 release），清缓存 data/wxacode/poster.png 重新生成。
+     */
+    wxacodeEnv: str(process.env.WXACODE_ENV_VERSION, 'release')
   },
 
   cors: {

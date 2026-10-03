@@ -95,7 +95,8 @@ export async function getPosterWxacode(): Promise<Buffer> {
       auto_color: false,
       line_color: { r: 74, g: 157, b: 126 },
       check_path: true,
-      env_version: 'release'
+      // release=正式版（默认）/ trial=体验版（未发布期间配 WXACODE_ENV_VERSION=trial）
+      env_version: config.wechat.wxacodeEnv
     }));
     req.end();
   });
@@ -104,7 +105,11 @@ export async function getPosterWxacode(): Promise<Buffer> {
   if (raw.length > 0 && raw[0] === 0x7B) {
     let err: any = {};
     try { err = JSON.parse(raw.toString('utf8')); } catch { /* ignore */ }
-    logger.warn('getwxacodeunlimit failed', { errcode: err.errcode, errmsg: err.errmsg });
+    logger.warn('getwxacodeunlimit failed', { errcode: err.errcode, errmsg: err.errmsg, env: config.wechat.wxacodeEnv });
+    if (err.errcode === 41030) {
+      throw new Error(`生成小程序码失败: 41030 page 不存在 —— env=${config.wechat.wxacodeEnv}，` +
+        (config.wechat.wxacodeEnv === 'release' ? '小程序未发布或页面路径不匹配；体验版期间可设 WXACODE_ENV_VERSION=trial' : '体验版未上传该页面，请先在开发者工具上传体验版'));
+    }
     throw new Error(`生成小程序码失败: ${err.errcode} ${err.errmsg}`);
   }
 

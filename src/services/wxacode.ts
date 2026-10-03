@@ -76,29 +76,38 @@ export async function getPosterWxacode(): Promise<Buffer> {
 
   const token = await getAccessToken();
   const url = `https://api.weixin.qq.com/wxa/getwxacodeunlimit?access_token=${token}`;
+  const body = JSON.stringify({
+    scene: 'from=poster',
+    page: 'pages/index/index',
+    width: 430,
+    auto_color: false,
+    line_color: { r: 74, g: 157, b: 126 },
+    check_path: true,
+    // release=正式版（默认）/ trial=体验版（未发布期间配 WXACODE_ENV_VERSION=trial）
+    env_version: config.wechat.wxacodeEnv
+  });
+  // ⚠️ 必须显式带 Content-Length：Node 默认 chunked 传输，api.weixin.qq.com
+  // 有概率直接 socket hang up（2026-10-03 现网实锤）
   const raw = await new Promise<Buffer>((resolve, reject) => {
-    const req = https.request(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 15000
-    }, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (c: Buffer) => chunks.push(c));
-      res.on('end', () => resolve(Buffer.concat(chunks)));
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(new Error('request timeout')); });
-    req.write(JSON.stringify({
-      scene: 'from=poster',
-      page: 'pages/index/index',
-      width: 430,
-      auto_color: false,
-      line_color: { r: 74, g: 157, b: 126 },
-      check_path: true,
-      // release=正式版（默认）/ trial=体验版（未发布期间配 WXACODE_ENV_VERSION=trial）
-      env_version: config.wechat.wxacodeEnv
-    }));
-    req.end();
+    const attempt = (retries: number) => {
+      const req = https.request(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        timeout: 15000
+      }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+      });
+      req.on('error', (e) => {
+        if (retries > 0) return attempt(retries - 1);
+        reject(e);
+      });
+      req.on('timeout', () => { req.destroy(new Error('request timeout')); });
+      req.write(body);
+      req.end();
+    };
+    attempt(1);
   });
 
   // 微信出错时返回 JSON（首字节 '{'），成功时返回图片二进制
@@ -111,6 +120,11 @@ export async function getPosterWxacode(): Promise<Buffer> {
         (config.wechat.wxacodeEnv === 'release' ? '小程序未发布或页面路径不匹配；体验版期间可设 WXACODE_ENV_VERSION=trial' : '体验版未上传该页面，请先在开发者工具上传体验版'));
     }
     throw new Error(`生成小程序码失败: ${err.errcode} ${err.errmsg}`);
+  }
+
+  // 空响应（连接被掐断等）绝不能当成功缓存 —— 2026-10-03 实锤缓存了 0 字节文件
+  if (raw.length === 0) {
+    throw new Error('生成小程序码失败: 微信返回空响应（已重试）');
   }
 
   fs.mkdirSync(CACHE_DIR, { recursive: true });

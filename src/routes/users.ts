@@ -10,6 +10,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { authRequired } from '../middleware/auth';
 import { getUserById, normalizeTier, updateNickname, updateProfile } from '../services/users';
+import { reconcileProUser } from '../services/vpay';
 import { config } from '../config';
 import { BizError } from '../middleware/error';
 
@@ -24,16 +25,28 @@ router.get('/me', async (req, res, next) => {
     const u = await getUserById(req.user!.id);
     if (!u) return next(new BizError('NOT_FOUND', 404, '用户不存在'));
 
+    // 对账兜底：Pro 用户在读取资料时节流查一次微信侧订单状态，
+    // 推送（xpay_refund_notify）丢失导致「已退款仍持有 Pro」时自动收回。
+    // 查询失败/超时一律静默跳过，不影响本接口响应。
+    let tier = normalizeTier(u.tier);
+    if (tier === 'pro') {
+      const reconciled = await reconcileProUser(u.id);
+      if (reconciled === 'free') {
+        const fresh = await getUserById(req.user!.id);
+        if (fresh) tier = normalizeTier(fresh.tier);
+      }
+    }
+
     res.json({
       code: 0,
       data: {
         id: u.id,
         nickname: u.nickname,
         avatar: u.avatar,
-        tier: normalizeTier(u.tier),
+        tier,
         limits: {
           // 免费用户云端保留「几个有数据的日期」；Pro 为 null 表示不限
-          cloudWindowDates: normalizeTier(u.tier) === 'pro' ? null : config.tier.freeWindowDates
+          cloudWindowDates: tier === 'pro' ? null : config.tier.freeWindowDates
         }
       }
     });

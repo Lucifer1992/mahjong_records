@@ -600,6 +600,70 @@ export async function createRefundRequest(
 }
 
 // ---------------------------------------------------------------------------
+// 对账兜底：推送丢失时主动查单收回 Pro
+// ---------------------------------------------------------------------------
+
+/**
+ * 每用户节流（内存 Map，重启即重置——只是限频手段，不影响正确性）。
+ * 背景：MP 后台退款后 xpay_refund_notify 可能不推送（2026-10-02 现网实锤：
+ * 退款完成但服务器日志无任何 refund 推送，订单永远停在 paid）。
+ * 兜底：Pro 用户请求 /me 时节流查一次 query_order，微信侧已退款则收回。
+ */
+const reconcileThrottle = new Map<string, number>();
+const RECONCILE_INTERVAL_MS = 60 * 60 * 1000; // 每用户 1 小时最多查一次
+
+/**
+ * 对账单个 Pro 用户：查其最近一笔 paid 订单在微信侧的真实状态。
+ *
+ * 口径（与 scripts/vpay-reconcile.js 一致，已在现网验证可行）：
+ *   query_order 返回 status：1=已创建未支付；2/3/4=已支付；5-8=已关闭/退款
+ *   status >= 5 且本地仍是 paid → markOrderRefunded（内部幂等 + 会检查
+ *   其他 paid 订单，多单场景不会误降）→ setTier('free')
+ *
+ * 安全性：查不到 / 超时 / errcode 非 0 一律返回 null（不降级），绝不因
+ * 兜底链路故障误伤正常 Pro 用户。
+ *
+ * @returns 'free' 表示本次对账实际降级了；null 表示无需动作或查询失败
+ */
+export async function reconcileProUser(userId: string): Promise<'free' | null> {
+  const last = reconcileThrottle.get(userId) ?? 0;
+  if (Date.now() - last < RECONCILE_INTERVAL_MS) return null;
+  reconcileThrottle.set(userId, Date.now());
+
+  try {
+    // 1. 找最近一笔本地 paid 订单（没有 → 权益状态异常但无从对账，放行）
+    const order = await db.queryOne<{ out_trade_no: string }>(
+      `SELECT out_trade_no FROM vpay_orders WHERE user_id = ? AND status = 'paid' ORDER BY paid_at DESC LIMIT 1`,
+      [userId]
+    );
+    if (!order) return null;
+
+    // 2. 拿 openid（query_order 必填）
+    const userRow = await db.queryOne<{ openid: string }>('SELECT openid FROM users WHERE id = ?', [userId]);
+    if (!userRow?.openid) {
+      logger.warn('vpay reconcile: user openid missing', { userId });
+      return null;
+    }
+
+    // 3. 查微信侧真实状态
+    const wx = await queryOrderFromWx(userRow.openid, order.out_trade_no);
+    if (!wx) return null; // 查询失败 → 不动作，等下个节流窗口
+
+    if (wx.orderStatus >= 5) {
+      logger.warn('vpay reconcile: wx side refunded/closed but local paid, revoking', {
+        userId, outTradeNo: order.out_trade_no, wxStatus: wx.orderStatus
+      });
+      const changed = await markOrderRefunded(order.out_trade_no);
+      return changed ? 'free' : null;
+    }
+    return null;
+  } catch (e: any) {
+    logger.warn('vpay reconcile error', { userId, err: e?.message });
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 消息推送：GET 握手 + POST 推送（安全模式 AES 解密）
 // ---------------------------------------------------------------------------
 
